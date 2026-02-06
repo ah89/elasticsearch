@@ -49,6 +49,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.IntUnaryOperator;
 
@@ -70,6 +71,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
     private final int numMergeWorkers;
     private final int blockDimension;
     private final boolean doPrecondition;
+    private final boolean useWeightedGlobalCentroid;
 
     public ESNextDiskBBQVectorsWriter(
         SegmentWriteState state,
@@ -82,7 +84,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
         TaskExecutor mergeExec,
         int numMergeWorkers,
         int blockDimension,
-        boolean doPrecondition
+        boolean doPrecondition,
+        boolean useWeightedGlobalCentroid
     ) throws IOException {
         super(state, rawVectorFormatName, useDirectIOReads, rawVectorDelegate, ESNextDiskBBQVectorsFormat.VERSION_CURRENT);
         this.vectorPerCluster = vectorPerCluster;
@@ -92,6 +95,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
         this.numMergeWorkers = numMergeWorkers;
         this.blockDimension = blockDimension;
         this.doPrecondition = doPrecondition;
+        this.useWeightedGlobalCentroid = useWeightedGlobalCentroid;
     }
 
     @Override
@@ -721,9 +725,36 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
         if (logger.isDebugEnabled()) {
             logger.debug("final centroid count: {}", centroids.length);
         }
+        if (logger.isInfoEnabled()) {
+            float min0 = Float.POSITIVE_INFINITY;
+            float max0 = Float.NEGATIVE_INFINITY;
+            float sum0 = 0f;
+            int far = 0;
+            for (float[] centroid : centroids) {
+                float x0 = centroid[0];
+                sum0 += x0;
+                min0 = Math.min(min0, x0);
+                max0 = Math.max(max0, x0);
+                if (x0 > 1000f) {
+                    far++;
+                }
+            }
+            float mean0 = sum0 / centroids.length;
+            logger.info(
+                "centroid axis0 stats: count={}, mean0={}, min0={}, max0={}, far(>1000)={}",
+                centroids.length,
+                String.format(Locale.ROOT, "%.4f", mean0),
+                String.format(Locale.ROOT, "%.4f", min0),
+                String.format(Locale.ROOT, "%.4f", max0),
+                far
+            );
+        }
         int[] assignments = kMeansResult.assignments();
         int[] soarAssignments = kMeansResult.soarAssignments();
-        return new CentroidAssignments(fieldInfo.getVectorDimension(), centroids, assignments, soarAssignments);
+        float[] globalCentroid = useWeightedGlobalCentroid
+            ? CentroidAssignments.computeWeightedGlobalCentroid(fieldInfo.getVectorDimension(), centroids, assignments)
+            : CentroidAssignments.computeGlobalCentroid(fieldInfo.getVectorDimension(), centroids);
+        return CentroidAssignments.create(fieldInfo.getVectorDimension(), centroids, assignments, soarAssignments, globalCentroid);
     }
 
     static void writeQuantizedValue(IndexOutput indexOutput, byte[] binaryValue, OptimizedScalarQuantizer.QuantizationResult corrections)

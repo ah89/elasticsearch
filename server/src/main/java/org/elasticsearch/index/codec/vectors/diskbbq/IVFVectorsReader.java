@@ -380,6 +380,24 @@ public abstract class IVFVectorsReader extends KnnVectorsReader {
         IOUtils.close(closeables);
     }
 
+    /** Expose the stored global centroid for debugging/analysis. */
+    public float[] globalCentroid(FieldInfo fieldInfo) {
+        FieldEntry entry = fields.get(fieldInfo.number);
+        return entry == null ? null : entry.globalCentroid();
+    }
+
+    /** Expose the stored global centroid dot product for debugging/analysis. */
+    public float globalCentroidDp(FieldInfo fieldInfo) {
+        FieldEntry entry = fields.get(fieldInfo.number);
+        return entry == null ? 0f : entry.globalCentroidDp();
+    }
+
+    /** Expose the stored centroid count for debugging/analysis. */
+    public int numCentroids(FieldInfo fieldInfo) {
+        FieldEntry entry = fields.get(fieldInfo.number);
+        return entry == null ? 0 : entry.numCentroids();
+    }
+
     protected static class FieldEntry implements GenericFlatVectorReaders.Field {
         protected final String rawVectorFormatName;
         protected final boolean useDirectIOReads;

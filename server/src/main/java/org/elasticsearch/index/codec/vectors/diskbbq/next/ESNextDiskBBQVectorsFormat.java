@@ -224,6 +224,7 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
     private final int numMergeWorkers;
     private final boolean doPrecondition;
     private final int preconditioningBlockDimension;
+    private final boolean useWeightedGlobalCentroid;
 
     public ESNextDiskBBQVectorsFormat(int vectorPerCluster, int centroidsPerParentCluster) {
         this(QuantEncoding.ONE_BIT_4BIT_QUERY, vectorPerCluster, centroidsPerParentCluster);
@@ -239,7 +240,8 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
             null,
             1,
             false,
-            DEFAULT_PRECONDITIONING_BLOCK_DIMENSION
+            DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+            false
         );
     }
 
@@ -252,7 +254,8 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
         ExecutorService mergingExecutorService,
         int maxMergingWorkers,
         boolean doPrecondition,
-        int preconditioningBlockDimension
+        int preconditioningBlockDimension,
+        boolean useWeightedGlobalCentroid
     ) {
         super(NAME);
         if (vectorPerCluster < MIN_VECTORS_PER_CLUSTER || vectorPerCluster > MAX_VECTORS_PER_CLUSTER) {
@@ -300,6 +303,7 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
         this.numMergeWorkers = maxMergingWorkers;
         this.preconditioningBlockDimension = preconditioningBlockDimension;
         this.doPrecondition = doPrecondition;
+        this.useWeightedGlobalCentroid = useWeightedGlobalCentroid;
     }
 
     /** Constructs a format using the given graph construction parameters and scalar quantization. */
@@ -320,7 +324,8 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
             mergeExec,
             numMergeWorkers,
             preconditioningBlockDimension,
-            doPrecondition
+            doPrecondition,
+            useWeightedGlobalCentroid
         );
     }
 

@@ -23,9 +23,11 @@ import org.apache.lucene.index.LogDocMergePolicy;
 import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.TieredMergePolicy;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.util.NamedThreadFactory;
 import org.elasticsearch.cli.ProcessInfo;
 import org.elasticsearch.common.Strings;
@@ -36,6 +38,7 @@ import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.gpu.codec.ES92GpuHnswSQVectorsFormat;
 import org.elasticsearch.gpu.codec.ES92GpuHnswVectorsFormat;
 import org.elasticsearch.index.codec.vectors.diskbbq.ES920DiskBBQVectorsFormat;
+import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat;
 import org.elasticsearch.index.codec.vectors.es93.ES93BinaryQuantizedVectorsFormat;
 import org.elasticsearch.index.codec.vectors.es93.ES93HnswBinaryQuantizedVectorsFormat;
@@ -163,7 +166,8 @@ public class KnnIndexTester {
                 exec,
                 exec != null ? args.numMergeWorkers() : 1,
                 args.doPrecondition(),
-                args.preconditioningBlockDims()
+                args.preconditioningBlockDims(),
+                args.weightedGlobalCentroid()
             );
         } else if (args.indexType() == IndexType.GPU_HNSW) {
             if (quantizeBits == 32) {
@@ -374,6 +378,9 @@ public class KnnIndexTester {
                     }
                 }
                 numSegments(indexPath, indexResults);
+                if (testConfiguration.indexType() == IndexType.IVF) {
+                    logGlobalCentroid(indexPath, KnnIndexer.VECTOR_FIELD);
+                }
                 if (testConfiguration.queryVectors() != null && testConfiguration.numQueries() > 0) {
                     if (parsedArgs.warmUpIterations() > 0) {
                         logger.info("Running the searches for " + parsedArgs.warmUpIterations() + " warm up iterations");
@@ -422,6 +429,48 @@ public class KnnIndexTester {
             result.numSegments = reader.leaves().size();
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to get segment count for index at " + indexPath, e);
+        }
+    }
+
+    static void logGlobalCentroid(Path indexPath, String fieldName) {
+        try (FSDirectory dir = FSDirectory.open(indexPath); IndexReader reader = DirectoryReader.open(dir)) {
+            if (reader.leaves().isEmpty()) {
+                return;
+            }
+            if (reader.leaves().get(0).reader() instanceof SegmentReader segmentReader) {
+                var fieldInfo = segmentReader.getFieldInfos().fieldInfo(fieldName);
+                if (fieldInfo == null) {
+                    return;
+                }
+                SegmentReadState readState = new SegmentReadState(
+                    dir,
+                    segmentReader.getSegmentInfo().info,
+                    segmentReader.getFieldInfos(),
+                    IOContext.READONCE
+                );
+                var codec = segmentReader.getSegmentInfo().info.getCodec();
+                KnnVectorsReader vectorsReader = codec.knnVectorsFormat().fieldsReader(readState);
+                try (vectorsReader) {
+                    KnnVectorsReader fieldReader = vectorsReader;
+                    if (vectorsReader instanceof org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat.FieldsReader perField) {
+                        fieldReader = perField.getFieldReader(fieldName);
+                    }
+                    if (fieldReader instanceof IVFVectorsReader ivfReader) {
+                        float[] globalCentroid = ivfReader.globalCentroid(fieldInfo);
+                        if (globalCentroid != null && globalCentroid.length > 0) {
+                            logger.info(
+                                "globalCentroid: field={}, numCentroids={}, gc[0]={}, gcDp={}",
+                                fieldName,
+                                ivfReader.numCentroids(fieldInfo),
+                                String.format(Locale.ROOT, "%.4f", globalCentroid[0]),
+                                String.format(Locale.ROOT, "%.4f", ivfReader.globalCentroidDp(fieldInfo))
+                            );
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to read global centroid for index at " + indexPath, e);
         }
     }
 

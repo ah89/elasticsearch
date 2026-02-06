@@ -1793,6 +1793,16 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     doPrecondition = XContentMapValues.nodeBooleanValue(indexOptionsMap.remove("precondition"), false);
                 }
 
+                boolean weightedGlobalCentroid = false;
+                if (Build.current().isSnapshot()) {
+                    weightedGlobalCentroid = XContentMapValues.nodeBooleanValue(
+                        indexOptionsMap.remove("weighted_global_centroid"),
+                        false
+                    );
+                } else if (indexOptionsMap.containsKey("weighted_global_centroid")) {
+                    throw new IllegalArgumentException("weighted_global_centroid is only supported for snapshot builds");
+                }
+
                 MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
                 return new BBQIVFIndexOptions(
                     clusterSize,
@@ -1801,7 +1811,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     rescoreVector,
                     indexVersion,
                     doPrecondition,
-                    quantizeBits
+                    quantizeBits,
+                    weightedGlobalCentroid
                 );
             }
 
@@ -2455,6 +2466,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
         final IndexVersion indexVersionCreated;
         final int bits;
         final boolean doPrecondition;
+        final boolean weightedGlobalCentroid;
 
         BBQIVFIndexOptions(
             int clusterSize,
@@ -2463,7 +2475,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
             RescoreVector rescoreVector,
             IndexVersion indexVersionCreated,
             boolean doPrecondition,
-            int bits
+            int bits,
+            boolean weightedGlobalCentroid
         ) {
             super(VectorIndexType.BBQ_DISK, rescoreVector);
             this.clusterSize = clusterSize;
@@ -2472,6 +2485,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
             this.indexVersionCreated = indexVersionCreated;
             this.bits = bits;
             this.doPrecondition = doPrecondition;
+            this.weightedGlobalCentroid = weightedGlobalCentroid;
         }
 
         @Override
@@ -2495,7 +2509,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     mergingExecutorService,
                     numMergeWorkers,
                     doPrecondition,
-                    ESNextDiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION
+                    ESNextDiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+                    weightedGlobalCentroid
                 );
             }
             return new ES920DiskBBQVectorsFormat(
@@ -2520,12 +2535,14 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 && defaultVisitPercentage == that.defaultVisitPercentage
                 && onDiskRescore == that.onDiskRescore
                 && bits == that.bits
+                && doPrecondition == that.doPrecondition
+                && weightedGlobalCentroid == that.weightedGlobalCentroid
                 && Objects.equals(rescoreVector, that.rescoreVector);
         }
 
         @Override
         int doHashCode() {
-            return Objects.hash(clusterSize, defaultVisitPercentage, onDiskRescore, rescoreVector, bits);
+            return Objects.hash(clusterSize, defaultVisitPercentage, onDiskRescore, rescoreVector, bits, doPrecondition, weightedGlobalCentroid);
         }
 
         @Override
@@ -2551,6 +2568,9 @@ public class DenseVectorFieldMapper extends FieldMapper {
             if (doPrecondition) {
                 builder.field("precondition", doPrecondition);
             }
+            if (weightedGlobalCentroid) {
+                builder.field("weighted_global_centroid", weightedGlobalCentroid);
+            }
             builder.endObject();
             return builder;
         }
@@ -2569,6 +2589,10 @@ public class DenseVectorFieldMapper extends FieldMapper {
 
         public boolean doPrecondition() {
             return doPrecondition;
+        }
+
+        public boolean weightedGlobalCentroid() {
+            return weightedGlobalCentroid;
         }
     }
 
