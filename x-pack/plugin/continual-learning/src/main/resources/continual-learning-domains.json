@@ -1,0 +1,49 @@
+{
+  "dynamic": "false",
+  "_meta": {
+    "version": "1"
+  },
+  "properties": {
+    "domain_id": {
+      "type": "keyword"
+    },
+    "domain_name": {
+      "type": "keyword"
+    },
+    "stage": {
+      "type": "integer"
+    },
+    "created_at": {
+      "type": "date",
+      "format": "epoch_millis||strict_date_optional_time"
+    },
+    "coreset_type": {
+      "type": "keyword"
+    },
+    "coreset_bytes": {
+      "type": "binary",
+      "doc_values": false
+    },
+    "lora_adapter_id": {
+      "type": "keyword"
+    },
+    "lora_rank": {
+      "type": "integer"
+    },
+    "intrinsic_rank": {
+      "type": "integer"
+    },
+    "novelty_score": {
+      "type": "float"
+    },
+    "embedding_dim": {
+      "type": "integer"
+    },
+    "jl_projected": {
+      "type": "boolean"
+    },
+    "jl_output_dim": {
+      "type": "integer"
+    }
+  }
+}
