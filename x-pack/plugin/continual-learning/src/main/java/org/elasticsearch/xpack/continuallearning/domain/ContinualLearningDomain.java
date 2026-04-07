@@ -34,12 +34,16 @@ public class ContinualLearningDomain implements Writeable, ToXContentObject {
     /** Identifies the coreset type used to summarise this domain's embeddings. */
     public enum CoresetType {
         GMM,
-        K_CENTER;
+        K_CENTER,
+        CONVEX_HULL,
+        HILBERT;
 
         public static CoresetType fromString(String value) {
             return switch (value.toUpperCase(java.util.Locale.ROOT)) {
                 case "GMM" -> GMM;
                 case "K_CENTER" -> K_CENTER;
+                case "CONVEX_HULL", "CONVEX" -> CONVEX_HULL;
+                case "HILBERT" -> HILBERT;
                 default -> throw new IllegalArgumentException("Unknown coreset type [" + value + "]");
             };
         }

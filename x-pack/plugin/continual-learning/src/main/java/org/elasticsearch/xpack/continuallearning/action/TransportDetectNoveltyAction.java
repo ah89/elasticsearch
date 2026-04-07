@@ -22,8 +22,10 @@ import org.elasticsearch.search.SearchHit;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.xpack.continuallearning.coreset.ConvexHullCoreset;
 import org.elasticsearch.xpack.continuallearning.coreset.GeometricCoreset;
 import org.elasticsearch.xpack.continuallearning.coreset.GmmCoreset;
+import org.elasticsearch.xpack.continuallearning.coreset.HilbertCoreset;
 import org.elasticsearch.xpack.continuallearning.coreset.KCenterCoreset;
 import org.elasticsearch.xpack.continuallearning.index.ContinualLearningSystemIndices;
 import org.elasticsearch.xpack.continuallearning.novelty.NoveltyDetector;
@@ -117,6 +119,8 @@ public class TransportDetectNoveltyAction extends HandledTransportAction<DetectN
         return switch (request.getCoresetType()) {
             case GMM -> GmmCoreset.fit(request.getEmbeddings(), request.getNumComponents(), rng);
             case K_CENTER -> KCenterCoreset.fit(request.getEmbeddings(), request.getNumComponents(), rng);
+            case CONVEX_HULL -> ConvexHullCoreset.fit(request.getEmbeddings(), request.getNumComponents(), rng);
+            case HILBERT -> HilbertCoreset.fit(request.getEmbeddings(), request.getNumComponents(), rng);
         };
     }
 
@@ -131,6 +135,8 @@ public class TransportDetectNoveltyAction extends HandledTransportAction<DetectN
             return switch (type) {
                 case GmmCoreset.TYPE -> new GmmCoreset(in);
                 case KCenterCoreset.TYPE -> new KCenterCoreset(in);
+                case ConvexHullCoreset.TYPE -> new ConvexHullCoreset(in);
+                case HilbertCoreset.TYPE -> new HilbertCoreset(in);
                 default -> null;
             };
         }
