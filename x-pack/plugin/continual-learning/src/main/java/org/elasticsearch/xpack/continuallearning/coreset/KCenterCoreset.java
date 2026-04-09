@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.continuallearning.coreset;
 
+import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xcontent.XContentBuilder;
@@ -155,12 +156,7 @@ public class KCenterCoreset implements GeometricCoreset {
     }
 
     private static float euclideanDistance(float[] a, float[] b) {
-        double sum = 0;
-        for (int i = 0; i < a.length; i++) {
-            double diff = a[i] - b[i];
-            sum += diff * diff;
-        }
-        return (float) Math.sqrt(sum);
+        return (float) Math.sqrt(VectorUtil.squareDistance(a, b));
     }
 
     // -------------------------------------------------------------------------

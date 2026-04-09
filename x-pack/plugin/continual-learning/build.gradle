@@ -14,15 +14,9 @@ base {
 
 dependencies {
   compileOnly project(path: xpackModule('core'))
+  implementation project(':libs:simdvec')
 
   testImplementation testArtifact(project(':server'))
   testImplementation testArtifact(project(xpackModule('core')))
 }
 
-tasks.withType(JavaCompile).configureEach {
-  options.compilerArgs += ['--add-modules', 'jdk.incubator.vector']
-}
-
-tasks.withType(Test).configureEach {
-  jvmArgs '--add-modules', 'jdk.incubator.vector'
-}

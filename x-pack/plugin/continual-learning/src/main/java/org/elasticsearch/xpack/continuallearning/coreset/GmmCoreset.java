@@ -7,13 +7,10 @@
 
 package org.elasticsearch.xpack.continuallearning.coreset;
 
+import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xcontent.XContentBuilder;
-
-import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorOperators;
-import jdk.incubator.vector.VectorSpecies;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -37,11 +34,6 @@ import java.util.Random;
 public class GmmCoreset implements GeometricCoreset {
 
     public static final String TYPE = "gmm";
-
-    /** SIMD vector species — uses platform-preferred width (128-bit NEON on ARM, 256-bit AVX on x86). */
-    private static final VectorSpecies<Float> F_SPECIES = FloatVector.SPECIES_PREFERRED;
-    /** Number of float lanes per SIMD register. */
-    private static final int F_LANES = F_SPECIES.length();
 
     /** Minimum per-dimension variance to prevent numerical collapse. */
     private static final float MIN_VARIANCE = 1e-6f;
@@ -148,21 +140,27 @@ public class GmmCoreset implements GeometricCoreset {
         double prevLogLikelihood = Double.NEGATIVE_INFINITY;
         double[][] responsibilities = new double[nEM][k];
 
-        // Reusable per-component float arrays for SIMD E-step
-        float[][] invVarF = new float[k][d];     // 1/variance as float
-        float[][] muInvVarF = new float[k][d];   // means * invVar as float
+        // Reusable per-component float arrays for E-step decomposition
+        float[][] invVarF = new float[k][d];     // 1/variance
+        float[][] muInvVarF = new float[k][d];   // means * invVar
         float[] muSqInvVarF = new float[k];      // sum(means^2 * invVar) per component
         double[] logConst = new double[k];
+
+        // Precompute x_i^2 for Lucene-accelerated E-step: mah = dot(x², iv) - 2·dot(x, μ·iv) + μ²·iv
+        float[][] emDataSq = new float[nEM][d];
+        for (int i = 0; i < nEM; i++) {
+            for (int dd = 0; dd < d; dd++) {
+                emDataSq[i][dd] = emData[i][dd] * emData[i][dd];
+            }
+        }
 
         // Reusable M-step accumulators
         float[] nkF = new float[k];
         float[][] sumX = new float[k][d];
         float[][] sumXsq = new float[k][d];
 
-        int bound = d - (d % F_LANES);
-
         for (int iter = 0; iter < MAX_EM_ITERATIONS; iter++) {
-            // Precompute per-component constants for E-step
+            // Precompute per-component constants
             for (int j = 0; j < k; j++) {
                 double logDet = 0;
                 float muSqIv = 0;
@@ -178,35 +176,14 @@ public class GmmCoreset implements GeometricCoreset {
                 logConst[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet);
             }
 
-            // ── E-step: SIMD Mahalanobis via decomposition ──
-            // mah(x,j) = x²·iv[j] - 2·x·(μ·iv)[j] + μ²·iv[j]
+            // ── E-step: Mahalanobis via Lucene SIMD dot products ──
+            // mah(x,j) = dot(x², iv[j]) - 2·dot(x, μ·iv[j]) + μ²·iv[j]
             double totalLogLikelihood = 0;
             for (int i = 0; i < nEM; i++) {
-                float[] xi = emData[i];
                 double maxLog = Double.NEGATIVE_INFINITY;
                 for (int j = 0; j < k; j++) {
-                    float[] ivj = invVarF[j];
-                    float[] mivj = muInvVarF[j];
-
-                    FloatVector sumT1 = FloatVector.zero(F_SPECIES);
-                    FloatVector sumT2 = FloatVector.zero(F_SPECIES);
-                    int dd = 0;
-                    for (; dd < bound; dd += F_LANES) {
-                        FloatVector vx = FloatVector.fromArray(F_SPECIES, xi, dd);
-                        FloatVector viv = FloatVector.fromArray(F_SPECIES, ivj, dd);
-                        FloatVector vmiv = FloatVector.fromArray(F_SPECIES, mivj, dd);
-                        // t1 += x² * iv  (via x * x * iv = x * (x*iv), using fma)
-                        sumT1 = vx.mul(vx).fma(viv, sumT1);
-                        // t2 += x * mu_iv
-                        sumT2 = vx.fma(vmiv, sumT2);
-                    }
-                    float t1 = sumT1.reduceLanes(VectorOperators.ADD);
-                    float t2 = sumT2.reduceLanes(VectorOperators.ADD);
-                    for (; dd < d; dd++) {
-                        float xd = xi[dd];
-                        t1 += xd * xd * ivj[dd];
-                        t2 += xd * mivj[dd];
-                    }
+                    float t1 = VectorUtil.dotProduct(emDataSq[i], invVarF[j]);
+                    float t2 = VectorUtil.dotProduct(emData[i], muInvVarF[j]);
                     double mahal = t1 - 2.0 * t2 + muSqInvVarF[j];
                     double lr = logConst[j] - 0.5 * mahal;
                     responsibilities[i][j] = lr;
@@ -220,7 +197,7 @@ public class GmmCoreset implements GeometricCoreset {
                 for (int j = 0; j < k; j++) responsibilities[i][j] = Math.exp(responsibilities[i][j] - logSum);
             }
 
-            // ── M-step: SIMD-accelerated accumulation ──
+            // ── M-step: sample-major accumulation ──
             Arrays.fill(nkF, 0f);
             for (int j = 0; j < k; j++) {
                 Arrays.fill(sumX[j], 0f);
@@ -233,18 +210,9 @@ public class GmmCoreset implements GeometricCoreset {
                 for (int j = 0; j < k; j++) {
                     float rij = (float) ri[j];
                     nkF[j] += rij;
-                    FloatVector vr = FloatVector.broadcast(F_SPECIES, rij);
                     float[] sj = sumX[j];
                     float[] sqj = sumXsq[j];
-                    int dd = 0;
-                    for (; dd < bound; dd += F_LANES) {
-                        FloatVector vx = FloatVector.fromArray(F_SPECIES, xi, dd);
-                        FloatVector vs = FloatVector.fromArray(F_SPECIES, sj, dd);
-                        FloatVector vsq = FloatVector.fromArray(F_SPECIES, sqj, dd);
-                        vx.fma(vr, vs).intoArray(sj, dd);
-                        vx.mul(vx).fma(vr, vsq).intoArray(sqj, dd);
-                    }
-                    for (; dd < d; dd++) {
+                    for (int dd = 0; dd < d; dd++) {
                         float xd = xi[dd];
                         sj[dd] += rij * xd;
                         sqj[dd] += rij * xd * xd;
@@ -352,25 +320,42 @@ public class GmmCoreset implements GeometricCoreset {
 
     /**
      * Computes the log-likelihood of a single point under this GMM.
-     * Used by the novelty detector for per-sample novelty scoring.
+     * Uses Lucene-accelerated dot products for the Mahalanobis decomposition.
      *
      * @param x embedding vector of length {@code dimension}
      * @return log p(x | GMM)
      */
     public double logLikelihood(float[] x) {
         int k = weights.length;
+        int d = dimension;
+
+        // Precompute x² once
+        float[] xSq = new float[d];
+        for (int dd = 0; dd < d; dd++) xSq[dd] = x[dd] * x[dd];
+
         double maxLog = Double.NEGATIVE_INFINITY;
         double[] logResp = new double[k];
         for (int j = 0; j < k; j++) {
-            logResp[j] = Math.log(weights[j] + 1e-300) + logGaussianDiag(x, means[j], variances[j]);
-            if (logResp[j] > maxLog) {
-                maxLog = logResp[j];
+            // Build iv and mu_iv for this component
+            float[] iv = new float[d];
+            float[] muIv = new float[d];
+            double logDet = 0;
+            float muSqIv = 0;
+            for (int dd = 0; dd < d; dd++) {
+                float v = Math.max(variances[j][dd], MIN_VARIANCE);
+                iv[dd] = 1.0f / v;
+                muIv[dd] = means[j][dd] * iv[dd];
+                muSqIv += means[j][dd] * muIv[dd];
+                logDet += Math.log(v);
             }
+            float t1 = VectorUtil.dotProduct(xSq, iv);
+            float t2 = VectorUtil.dotProduct(x, muIv);
+            double mahal = t1 - 2.0 * t2 + muSqIv;
+            logResp[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet + mahal);
+            if (logResp[j] > maxLog) maxLog = logResp[j];
         }
         double sum = 0;
-        for (int j = 0; j < k; j++) {
-            sum += Math.exp(logResp[j] - maxLog);
-        }
+        for (int j = 0; j < k; j++) sum += Math.exp(logResp[j] - maxLog);
         return maxLog + Math.log(sum);
     }
 
@@ -385,9 +370,8 @@ public class GmmCoreset implements GeometricCoreset {
         int m = batch.length;
         int k = weights.length;
         int d = dimension;
-        int bound = d - (d % F_LANES);
 
-        // Precompute per-component SIMD-friendly constants
+        // Precompute per-component constants
         float[][] ivF = new float[k][d];
         float[][] muIvF = new float[k][d];
         float[] muSqIvF = new float[k];
@@ -407,27 +391,21 @@ public class GmmCoreset implements GeometricCoreset {
             logConst[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet);
         }
 
+        // Precompute x² for all batch samples
+        float[][] batchSq = new float[m][d];
+        for (int i = 0; i < m; i++) {
+            for (int dd = 0; dd < d; dd++) {
+                batchSq[i][dd] = batch[i][dd] * batch[i][dd];
+            }
+        }
+
         double[] result = new double[m];
         for (int i = 0; i < m; i++) {
-            float[] xi = batch[i];
             double maxLog = Double.NEGATIVE_INFINITY;
             double[] lr = new double[k];
             for (int j = 0; j < k; j++) {
-                float[] ivj = ivF[j];
-                float[] mivj = muIvF[j];
-                FloatVector st1 = FloatVector.zero(F_SPECIES);
-                FloatVector st2 = FloatVector.zero(F_SPECIES);
-                int dd = 0;
-                for (; dd < bound; dd += F_LANES) {
-                    FloatVector vx = FloatVector.fromArray(F_SPECIES, xi, dd);
-                    st1 = vx.mul(vx).fma(FloatVector.fromArray(F_SPECIES, ivj, dd), st1);
-                    st2 = vx.fma(FloatVector.fromArray(F_SPECIES, mivj, dd), st2);
-                }
-                float t1 = st1.reduceLanes(VectorOperators.ADD);
-                float t2 = st2.reduceLanes(VectorOperators.ADD);
-                for (; dd < d; dd++) {
-                    float xd = xi[dd]; t1 += xd * xd * ivj[dd]; t2 += xd * mivj[dd];
-                }
+                float t1 = VectorUtil.dotProduct(batchSq[i], ivF[j]);
+                float t2 = VectorUtil.dotProduct(batch[i], muIvF[j]);
                 lr[j] = logConst[j] - 0.5 * (t1 - 2.0 * t2 + muSqIvF[j]);
                 if (lr[j] > maxLog) maxLog = lr[j];
             }
@@ -439,12 +417,7 @@ public class GmmCoreset implements GeometricCoreset {
     }
 
     private static double squaredEuclidean(float[] a, float[] b) {
-        double sum = 0;
-        for (int i = 0; i < a.length; i++) {
-            double diff = a[i] - b[i];
-            sum += diff * diff;
-        }
-        return sum;
+        return VectorUtil.squareDistance(a, b);
     }
 
     // -------------------------------------------------------------------------
