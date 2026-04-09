@@ -11,6 +11,10 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xcontent.XContentBuilder;
 
+import jdk.incubator.vector.FloatVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,14 +38,19 @@ public class GmmCoreset implements GeometricCoreset {
 
     public static final String TYPE = "gmm";
 
+    /** SIMD vector species — uses platform-preferred width (128-bit NEON on ARM, 256-bit AVX on x86). */
+    private static final VectorSpecies<Float> F_SPECIES = FloatVector.SPECIES_PREFERRED;
+    /** Number of float lanes per SIMD register. */
+    private static final int F_LANES = F_SPECIES.length();
+
     /** Minimum per-dimension variance to prevent numerical collapse. */
     private static final float MIN_VARIANCE = 1e-6f;
-    /** EM convergence threshold on relative log-likelihood change. */
-    private static final double EM_CONVERGENCE_THRESHOLD = 1e-4;
-    /** Maximum EM iterations. */
-    private static final int MAX_EM_ITERATIONS = 40;
-    /** Maximum samples used for EM fitting — subsampling preserves accuracy while bounding cost. */
-    private static final int MAX_EM_SAMPLES = 5000;
+    /** EM convergence threshold on relative log-likelihood change (matches sklearn default). */
+    private static final double EM_CONVERGENCE_THRESHOLD = 1e-3;
+    /** Maximum EM iterations — diagonal GMMs converge in 5-10 iterations typically. */
+    private static final int MAX_EM_ITERATIONS = 20;
+    /** Maximum samples used for EM fitting — bounds EM cost at O(MAX_EM_SAMPLES * K * d). */
+    private static final int MAX_EM_SAMPLES = 2000;
 
     private final int dimension;
     private final float[] weights;
@@ -135,94 +144,121 @@ public class GmmCoreset implements GeometricCoreset {
             Arrays.fill(row, 1.0f);
         }
 
-        // Precompute x_i^2 for efficient M-step variance: Var = E[X^2] - E[X]^2
-        double[][] emDataSq = new double[nEM][d];
-        for (int i = 0; i < nEM; i++) {
-            for (int dd = 0; dd < d; dd++) {
-                emDataSq[i][dd] = (double) emData[i][dd] * emData[i][dd];
-            }
-        }
-
-        // --- EM iterations with Mahalanobis decomposition ---
+        // --- EM iterations with SIMD-accelerated E-step and M-step ---
         double prevLogLikelihood = Double.NEGATIVE_INFINITY;
         double[][] responsibilities = new double[nEM][k];
 
-        // Precompute per-component constants for E-step (updated each iteration)
-        double[] invVar_flat = new double[k * d];  // inv_variance[j*d + dd]
+        // Reusable per-component float arrays for SIMD E-step
+        float[][] invVarF = new float[k][d];     // 1/variance as float
+        float[][] muInvVarF = new float[k][d];   // means * invVar as float
+        float[] muSqInvVarF = new float[k];      // sum(means^2 * invVar) per component
         double[] logConst = new double[k];
 
+        // Reusable M-step accumulators
+        float[] nkF = new float[k];
+        float[][] sumX = new float[k][d];
+        float[][] sumXsq = new float[k][d];
+
+        int bound = d - (d % F_LANES);
+
         for (int iter = 0; iter < MAX_EM_ITERATIONS; iter++) {
-            // E-step: compute responsibilities using Mahalanobis decomposition
-            // Precompute inv_var and log-constants
+            // Precompute per-component constants for E-step
             for (int j = 0; j < k; j++) {
                 double logDet = 0;
+                float muSqIv = 0;
                 for (int dd = 0; dd < d; dd++) {
-                    double v = Math.max(variances[j][dd], MIN_VARIANCE);
-                    invVar_flat[j * d + dd] = 1.0 / v;
+                    float v = Math.max(variances[j][dd], MIN_VARIANCE);
+                    float iv = 1.0f / v;
+                    invVarF[j][dd] = iv;
+                    muInvVarF[j][dd] = means[j][dd] * iv;
+                    muSqIv += means[j][dd] * muInvVarF[j][dd];
                     logDet += Math.log(v);
                 }
+                muSqInvVarF[j] = muSqIv;
                 logConst[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet);
             }
 
+            // ── E-step: SIMD Mahalanobis via decomposition ──
+            // mah(x,j) = x²·iv[j] - 2·x·(μ·iv)[j] + μ²·iv[j]
             double totalLogLikelihood = 0;
             for (int i = 0; i < nEM; i++) {
+                float[] xi = emData[i];
                 double maxLog = Double.NEGATIVE_INFINITY;
                 for (int j = 0; j < k; j++) {
-                    // Mahalanobis: sum_d (x_d - mu_d)^2 / var_d
-                    //            = sum_d x_d^2/var_d - 2*x_d*mu_d/var_d + mu_d^2/var_d
-                    double mahal = 0;
-                    int base = j * d;
-                    for (int dd = 0; dd < d; dd++) {
-                        double iv = invVar_flat[base + dd];
-                        double xd = emData[i][dd];
-                        double md = means[j][dd];
-                        mahal += (xd - md) * (xd - md) * iv;
+                    float[] ivj = invVarF[j];
+                    float[] mivj = muInvVarF[j];
+
+                    FloatVector sumT1 = FloatVector.zero(F_SPECIES);
+                    FloatVector sumT2 = FloatVector.zero(F_SPECIES);
+                    int dd = 0;
+                    for (; dd < bound; dd += F_LANES) {
+                        FloatVector vx = FloatVector.fromArray(F_SPECIES, xi, dd);
+                        FloatVector viv = FloatVector.fromArray(F_SPECIES, ivj, dd);
+                        FloatVector vmiv = FloatVector.fromArray(F_SPECIES, mivj, dd);
+                        // t1 += x² * iv  (via x * x * iv = x * (x*iv), using fma)
+                        sumT1 = vx.mul(vx).fma(viv, sumT1);
+                        // t2 += x * mu_iv
+                        sumT2 = vx.fma(vmiv, sumT2);
                     }
+                    float t1 = sumT1.reduceLanes(VectorOperators.ADD);
+                    float t2 = sumT2.reduceLanes(VectorOperators.ADD);
+                    for (; dd < d; dd++) {
+                        float xd = xi[dd];
+                        t1 += xd * xd * ivj[dd];
+                        t2 += xd * mivj[dd];
+                    }
+                    double mahal = t1 - 2.0 * t2 + muSqInvVarF[j];
                     double lr = logConst[j] - 0.5 * mahal;
                     responsibilities[i][j] = lr;
-                    if (lr > maxLog) {
-                        maxLog = lr;
-                    }
+                    if (lr > maxLog) maxLog = lr;
                 }
                 // log-sum-exp normalisation
                 double logSum = 0;
-                for (int j = 0; j < k; j++) {
-                    logSum += Math.exp(responsibilities[i][j] - maxLog);
-                }
+                for (int j = 0; j < k; j++) logSum += Math.exp(responsibilities[i][j] - maxLog);
                 logSum = maxLog + Math.log(logSum);
                 totalLogLikelihood += logSum;
-                for (int j = 0; j < k; j++) {
-                    responsibilities[i][j] = Math.exp(responsibilities[i][j] - logSum);
-                }
+                for (int j = 0; j < k; j++) responsibilities[i][j] = Math.exp(responsibilities[i][j] - logSum);
             }
 
-            // M-step using E[X^2] - E[X]^2 decomposition
-            double[] nk = new double[k];
+            // ── M-step: SIMD-accelerated accumulation ──
+            Arrays.fill(nkF, 0f);
+            for (int j = 0; j < k; j++) {
+                Arrays.fill(sumX[j], 0f);
+                Arrays.fill(sumXsq[j], 0f);
+            }
+
             for (int i = 0; i < nEM; i++) {
+                float[] xi = emData[i];
+                double[] ri = responsibilities[i];
                 for (int j = 0; j < k; j++) {
-                    nk[j] += responsibilities[i][j];
+                    float rij = (float) ri[j];
+                    nkF[j] += rij;
+                    FloatVector vr = FloatVector.broadcast(F_SPECIES, rij);
+                    float[] sj = sumX[j];
+                    float[] sqj = sumXsq[j];
+                    int dd = 0;
+                    for (; dd < bound; dd += F_LANES) {
+                        FloatVector vx = FloatVector.fromArray(F_SPECIES, xi, dd);
+                        FloatVector vs = FloatVector.fromArray(F_SPECIES, sj, dd);
+                        FloatVector vsq = FloatVector.fromArray(F_SPECIES, sqj, dd);
+                        vx.fma(vr, vs).intoArray(sj, dd);
+                        vx.mul(vx).fma(vr, vsq).intoArray(sqj, dd);
+                    }
+                    for (; dd < d; dd++) {
+                        float xd = xi[dd];
+                        sj[dd] += rij * xd;
+                        sqj[dd] += rij * xd * xd;
+                    }
                 }
             }
 
             for (int j = 0; j < k; j++) {
-                double nkj = Math.max(nk[j], 1e-10);
-                weights[j] = (float) (nk[j] / nEM);
-
-                // Mean: E[X] = sum(r_ij * x_i) / N_k
-                double[] newMean = new double[d];
-                double[] eMeanSq = new double[d]; // E[X^2]
-                for (int i = 0; i < nEM; i++) {
-                    double rij = responsibilities[i][j];
-                    for (int dd = 0; dd < d; dd++) {
-                        newMean[dd] += rij * emData[i][dd];
-                        eMeanSq[dd] += rij * emDataSq[i][dd];
-                    }
-                }
+                float nkj = Math.max(nkF[j], 1e-10f);
+                weights[j] = nkF[j] / nEM;
                 for (int dd = 0; dd < d; dd++) {
-                    double mu = newMean[dd] / nkj;
-                    means[j][dd] = (float) mu;
-                    // Var = E[X^2] - E[X]^2
-                    variances[j][dd] = (float) Math.max(eMeanSq[dd] / nkj - mu * mu, MIN_VARIANCE);
+                    float mu = sumX[j][dd] / nkj;
+                    means[j][dd] = mu;
+                    variances[j][dd] = Math.max(sumXsq[j][dd] / nkj - mu * mu, MIN_VARIANCE);
                 }
             }
 
@@ -340,7 +376,7 @@ public class GmmCoreset implements GeometricCoreset {
 
     /**
      * Computes log-likelihoods for a batch of points under this GMM.
-     * Amortises JIT overhead and enables cache-friendly access patterns.
+     * Uses SIMD-accelerated Mahalanobis decomposition with precomputed constants.
      *
      * @param batch array of embedding vectors, each of length {@code dimension}
      * @return array of log p(x | GMM) for each input
@@ -349,40 +385,54 @@ public class GmmCoreset implements GeometricCoreset {
         int m = batch.length;
         int k = weights.length;
         int d = dimension;
+        int bound = d - (d % F_LANES);
 
-        // Precompute per-component constants
-        double[] invVar = new double[k * d];
+        // Precompute per-component SIMD-friendly constants
+        float[][] ivF = new float[k][d];
+        float[][] muIvF = new float[k][d];
+        float[] muSqIvF = new float[k];
         double[] logConst = new double[k];
         for (int j = 0; j < k; j++) {
             double logDet = 0;
+            float msiv = 0;
             for (int dd = 0; dd < d; dd++) {
-                double v = Math.max(variances[j][dd], MIN_VARIANCE);
-                invVar[j * d + dd] = 1.0 / v;
+                float v = Math.max(variances[j][dd], MIN_VARIANCE);
+                float iv = 1.0f / v;
+                ivF[j][dd] = iv;
+                muIvF[j][dd] = means[j][dd] * iv;
+                msiv += means[j][dd] * muIvF[j][dd];
                 logDet += Math.log(v);
             }
+            muSqIvF[j] = msiv;
             logConst[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet);
         }
 
         double[] result = new double[m];
         for (int i = 0; i < m; i++) {
+            float[] xi = batch[i];
             double maxLog = Double.NEGATIVE_INFINITY;
             double[] lr = new double[k];
             for (int j = 0; j < k; j++) {
-                double mahal = 0;
-                int base = j * d;
-                for (int dd = 0; dd < d; dd++) {
-                    double diff = batch[i][dd] - means[j][dd];
-                    mahal += diff * diff * invVar[base + dd];
+                float[] ivj = ivF[j];
+                float[] mivj = muIvF[j];
+                FloatVector st1 = FloatVector.zero(F_SPECIES);
+                FloatVector st2 = FloatVector.zero(F_SPECIES);
+                int dd = 0;
+                for (; dd < bound; dd += F_LANES) {
+                    FloatVector vx = FloatVector.fromArray(F_SPECIES, xi, dd);
+                    st1 = vx.mul(vx).fma(FloatVector.fromArray(F_SPECIES, ivj, dd), st1);
+                    st2 = vx.fma(FloatVector.fromArray(F_SPECIES, mivj, dd), st2);
                 }
-                lr[j] = logConst[j] - 0.5 * mahal;
-                if (lr[j] > maxLog) {
-                    maxLog = lr[j];
+                float t1 = st1.reduceLanes(VectorOperators.ADD);
+                float t2 = st2.reduceLanes(VectorOperators.ADD);
+                for (; dd < d; dd++) {
+                    float xd = xi[dd]; t1 += xd * xd * ivj[dd]; t2 += xd * mivj[dd];
                 }
+                lr[j] = logConst[j] - 0.5 * (t1 - 2.0 * t2 + muSqIvF[j]);
+                if (lr[j] > maxLog) maxLog = lr[j];
             }
             double sum = 0;
-            for (int j = 0; j < k; j++) {
-                sum += Math.exp(lr[j] - maxLog);
-            }
+            for (int j = 0; j < k; j++) sum += Math.exp(lr[j] - maxLog);
             result[i] = maxLog + Math.log(sum);
         }
         return result;
