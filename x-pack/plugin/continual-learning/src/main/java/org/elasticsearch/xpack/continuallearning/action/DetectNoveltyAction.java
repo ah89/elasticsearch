@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.continuallearning.action;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
+import org.elasticsearch.action.ValidateActions;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xcontent.ToXContentObject;
@@ -91,7 +92,7 @@ public class DetectNoveltyAction extends ActionType<DetectNoveltyAction.Response
         @Override
         public ActionRequestValidationException validate() {
             if (embeddings == null || embeddings.length == 0) {
-                return addValidationError("embeddings must be non-empty", null);
+                return ValidateActions.addValidationError("embeddings must be non-empty", null);
             }
             return null;
         }

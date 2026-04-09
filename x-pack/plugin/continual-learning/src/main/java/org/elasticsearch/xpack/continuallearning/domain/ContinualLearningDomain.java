@@ -141,7 +141,7 @@ public class ContinualLearningDomain implements Writeable, ToXContentObject {
         builder.field("domain_id", domainId);
         builder.field("domain_name", domainName);
         builder.field("stage", stage);
-        builder.timeField("created_at", "created_at_string", createdAtMillis);
+        builder.field("created_at", createdAtMillis);
         builder.field("coreset_type", coresetType.name().toLowerCase(java.util.Locale.ROOT));
         builder.field("lora_rank", loraRank);
         builder.field("intrinsic_rank", intrinsicRank);

@@ -84,6 +84,16 @@ public class KCenterCoreset implements GeometricCoreset {
      * @param rng        random source for the initial centre selection
      * @return fitted {@link KCenterCoreset}
      */
+    /**
+     * Builds a k-center coreset using greedy farthest-first traversal with
+     * inline assignment tracking.
+     *
+     * <p>The covering radii are computed during the traversal itself (each point's
+     * minimum distance to its nearest centre is already maintained in {@code minDist}).
+     * This eliminates the separate {@code O(n * k * d)} radii computation pass,
+     * reducing total time from {@code O(n * k * d)} to {@code O(n * k * d)} with a
+     * constant factor of 1 instead of 2.
+     */
     public static KCenterCoreset fit(float[][] embeddings, int k, Random rng) {
         if (embeddings.length == 0) {
             throw new IllegalArgumentException("Cannot fit k-center coreset to empty embedding set");
@@ -94,11 +104,15 @@ public class KCenterCoreset implements GeometricCoreset {
 
         int[] centerIndices = new int[k];
         float[] minDist = new float[n];
-        Arrays.fill(minDist, Float.MAX_VALUE);
+        int[] assignment = new int[n]; // which centre each point is assigned to
 
         // Pick first centre at random
         centerIndices[0] = rng.nextInt(n);
-        updateMinDist(embeddings, centerIndices[0], minDist);
+        float[] firstCenter = embeddings[centerIndices[0]];
+        for (int i = 0; i < n; i++) {
+            minDist[i] = euclideanDistance(embeddings[i], firstCenter);
+            assignment[i] = 0;
+        }
 
         for (int c = 1; c < k; c++) {
             // Next centre = farthest point from all current centres
@@ -111,49 +125,33 @@ public class KCenterCoreset implements GeometricCoreset {
                 }
             }
             centerIndices[c] = farthest;
-            updateMinDist(embeddings, farthest, minDist);
+            // Update min distances and assignments
+            float[] newCenter = embeddings[farthest];
+            for (int i = 0; i < n; i++) {
+                float dist = euclideanDistance(embeddings[i], newCenter);
+                if (dist < minDist[i]) {
+                    minDist[i] = dist;
+                    assignment[i] = c;
+                }
+            }
         }
 
-        // Build centre array and compute covering radii
+        // Build centre array
         float[][] centers = new float[k][d];
         for (int c = 0; c < k; c++) {
             centers[c] = Arrays.copyOf(embeddings[centerIndices[c]], d);
         }
 
-        float[] radii = computeRadii(embeddings, centers);
-        return new KCenterCoreset(d, centers, radii);
-    }
-
-    /** Updates minimum distance array after adding a new centre. */
-    private static void updateMinDist(float[][] embeddings, int newCenterIdx, float[] minDist) {
-        float[] newCenter = embeddings[newCenterIdx];
-        for (int i = 0; i < embeddings.length; i++) {
-            float dist = euclideanDistance(embeddings[i], newCenter);
-            if (dist < minDist[i]) {
-                minDist[i] = dist;
-            }
-        }
-    }
-
-    /** Computes the maximum distance from each embedding to its nearest centre. */
-    private static float[] computeRadii(float[][] embeddings, float[][] centers) {
-        int k = centers.length;
+        // Compute radii from tracked assignments — no re-scan needed
         float[] radii = new float[k];
-        for (float[] point : embeddings) {
-            int nearest = 0;
-            float minDist = Float.MAX_VALUE;
-            for (int c = 0; c < k; c++) {
-                float dist = euclideanDistance(point, centers[c]);
-                if (dist < minDist) {
-                    minDist = dist;
-                    nearest = c;
-                }
-            }
-            if (minDist > radii[nearest]) {
-                radii[nearest] = minDist;
+        for (int i = 0; i < n; i++) {
+            int c = assignment[i];
+            if (minDist[i] > radii[c]) {
+                radii[c] = minDist[i];
             }
         }
-        return radii;
+
+        return new KCenterCoreset(d, centers, radii);
     }
 
     private static float euclideanDistance(float[] a, float[] b) {
@@ -221,6 +219,37 @@ public class KCenterCoreset implements GeometricCoreset {
             return 0.0f;
         }
         return (float) Math.min(1.0, totalOverlap / totalWeight);
+    }
+
+    /**
+     * Returns the negative min-distance to any centre (higher = closer = more familiar).
+     */
+    @Override
+    public double scoreSample(float[] embedding) {
+        float minDist = Float.MAX_VALUE;
+        for (float[] center : centers) {
+            float dist = euclideanDistance(embedding, center);
+            if (dist < minDist) {
+                minDist = dist;
+            }
+        }
+        return -minDist;
+    }
+
+    @Override
+    public double[] batchScoreSamples(float[][] batch) {
+        double[] scores = new double[batch.length];
+        for (int i = 0; i < batch.length; i++) {
+            float minDist = Float.MAX_VALUE;
+            for (float[] center : centers) {
+                float dist = euclideanDistance(batch[i], center);
+                if (dist < minDist) {
+                    minDist = dist;
+                }
+            }
+            scores[i] = -minDist;
+        }
+        return scores;
     }
 
     private float computeCentroidProxyOverlap(GeometricCoreset other) {

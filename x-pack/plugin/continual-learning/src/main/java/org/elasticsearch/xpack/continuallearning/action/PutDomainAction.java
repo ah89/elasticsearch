@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.continuallearning.action;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
+import org.elasticsearch.action.ValidateActions;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.rest.RestStatus;
@@ -125,16 +126,16 @@ public class PutDomainAction extends ActionType<PutDomainAction.Response> {
         public ActionRequestValidationException validate() {
             ActionRequestValidationException e = null;
             if (domainId == null || domainId.isBlank()) {
-                e = addValidationError("domain_id is required", e);
+                e = ValidateActions.addValidationError("domain_id is required", e);
             }
             if (embeddings == null || embeddings.length == 0) {
-                e = addValidationError("embeddings must be non-empty", e);
+                e = ValidateActions.addValidationError("embeddings must be non-empty", e);
             }
             if (numComponents < 1) {
-                e = addValidationError("num_components must be >= 1", e);
+                e = ValidateActions.addValidationError("num_components must be >= 1", e);
             }
             if (useJlProjection && jlOutputDim < 1) {
-                e = addValidationError("jl_output_dim must be >= 1 when use_jl_projection is true", e);
+                e = ValidateActions.addValidationError("jl_output_dim must be >= 1 when use_jl_projection is true", e);
             }
             return e;
         }

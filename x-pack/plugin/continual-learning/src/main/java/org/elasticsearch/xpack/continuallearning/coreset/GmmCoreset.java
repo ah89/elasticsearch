@@ -36,10 +36,12 @@ public class GmmCoreset implements GeometricCoreset {
 
     /** Minimum per-dimension variance to prevent numerical collapse. */
     private static final float MIN_VARIANCE = 1e-6f;
-    /** EM convergence threshold on log-likelihood change. */
+    /** EM convergence threshold on relative log-likelihood change. */
     private static final double EM_CONVERGENCE_THRESHOLD = 1e-4;
     /** Maximum EM iterations. */
-    private static final int MAX_EM_ITERATIONS = 100;
+    private static final int MAX_EM_ITERATIONS = 40;
+    /** Maximum samples used for EM fitting — subsampling preserves accuracy while bounding cost. */
+    private static final int MAX_EM_SAMPLES = 5000;
 
     private final int dimension;
     private final float[] weights;
@@ -93,6 +95,13 @@ public class GmmCoreset implements GeometricCoreset {
      * Fits a GMM coreset to the provided embeddings using k-means++ initialisation
      * followed by EM.
      *
+     * <p>When the dataset exceeds {@link #MAX_EM_SAMPLES} embeddings, a random
+     * subsample is used for EM fitting.  This bounds EM cost at O(MAX_EM_SAMPLES * k * d)
+     * per iteration while preserving accuracy for diagonal-covariance GMMs.
+     *
+     * <p>Convergence is checked using relative log-likelihood change to avoid
+     * iteration count depending on absolute scale.
+     *
      * @param embeddings array of embedding vectors, each of length {@code d}
      * @param k          number of mixture components
      * @param rng        random source for reproducible results
@@ -106,8 +115,17 @@ public class GmmCoreset implements GeometricCoreset {
         int n = embeddings.length;
         k = Math.min(k, n);
 
+        // Subsample for EM fitting if dataset is large
+        float[][] emData;
+        if (n > MAX_EM_SAMPLES) {
+            emData = subsample(embeddings, MAX_EM_SAMPLES, rng);
+        } else {
+            emData = embeddings;
+        }
+        int nEM = emData.length;
+
         // --- k-means++ initialisation ---
-        float[][] means = kMeansPlusPlusInit(embeddings, k, rng);
+        float[][] means = kMeansPlusPlusInit(emData, k, rng);
 
         // --- Initialise equal weights and unit variances ---
         float[] weights = new float[k];
@@ -117,24 +135,126 @@ public class GmmCoreset implements GeometricCoreset {
             Arrays.fill(row, 1.0f);
         }
 
-        // --- EM iterations ---
+        // Precompute x_i^2 for efficient M-step variance: Var = E[X^2] - E[X]^2
+        double[][] emDataSq = new double[nEM][d];
+        for (int i = 0; i < nEM; i++) {
+            for (int dd = 0; dd < d; dd++) {
+                emDataSq[i][dd] = (double) emData[i][dd] * emData[i][dd];
+            }
+        }
+
+        // --- EM iterations with Mahalanobis decomposition ---
         double prevLogLikelihood = Double.NEGATIVE_INFINITY;
-        double[][] responsibilities = new double[n][k];
+        double[][] responsibilities = new double[nEM][k];
+
+        // Precompute per-component constants for E-step (updated each iteration)
+        double[] invVar_flat = new double[k * d];  // inv_variance[j*d + dd]
+        double[] logConst = new double[k];
 
         for (int iter = 0; iter < MAX_EM_ITERATIONS; iter++) {
-            // E-step
-            double logLikelihood = eStep(embeddings, means, variances, weights, responsibilities);
+            // E-step: compute responsibilities using Mahalanobis decomposition
+            // Precompute inv_var and log-constants
+            for (int j = 0; j < k; j++) {
+                double logDet = 0;
+                for (int dd = 0; dd < d; dd++) {
+                    double v = Math.max(variances[j][dd], MIN_VARIANCE);
+                    invVar_flat[j * d + dd] = 1.0 / v;
+                    logDet += Math.log(v);
+                }
+                logConst[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet);
+            }
 
-            // M-step
-            mStep(embeddings, responsibilities, means, variances, weights, d, k);
+            double totalLogLikelihood = 0;
+            for (int i = 0; i < nEM; i++) {
+                double maxLog = Double.NEGATIVE_INFINITY;
+                for (int j = 0; j < k; j++) {
+                    // Mahalanobis: sum_d (x_d - mu_d)^2 / var_d
+                    //            = sum_d x_d^2/var_d - 2*x_d*mu_d/var_d + mu_d^2/var_d
+                    double mahal = 0;
+                    int base = j * d;
+                    for (int dd = 0; dd < d; dd++) {
+                        double iv = invVar_flat[base + dd];
+                        double xd = emData[i][dd];
+                        double md = means[j][dd];
+                        mahal += (xd - md) * (xd - md) * iv;
+                    }
+                    double lr = logConst[j] - 0.5 * mahal;
+                    responsibilities[i][j] = lr;
+                    if (lr > maxLog) {
+                        maxLog = lr;
+                    }
+                }
+                // log-sum-exp normalisation
+                double logSum = 0;
+                for (int j = 0; j < k; j++) {
+                    logSum += Math.exp(responsibilities[i][j] - maxLog);
+                }
+                logSum = maxLog + Math.log(logSum);
+                totalLogLikelihood += logSum;
+                for (int j = 0; j < k; j++) {
+                    responsibilities[i][j] = Math.exp(responsibilities[i][j] - logSum);
+                }
+            }
 
-            if (Math.abs(logLikelihood - prevLogLikelihood) < EM_CONVERGENCE_THRESHOLD) {
+            // M-step using E[X^2] - E[X]^2 decomposition
+            double[] nk = new double[k];
+            for (int i = 0; i < nEM; i++) {
+                for (int j = 0; j < k; j++) {
+                    nk[j] += responsibilities[i][j];
+                }
+            }
+
+            for (int j = 0; j < k; j++) {
+                double nkj = Math.max(nk[j], 1e-10);
+                weights[j] = (float) (nk[j] / nEM);
+
+                // Mean: E[X] = sum(r_ij * x_i) / N_k
+                double[] newMean = new double[d];
+                double[] eMeanSq = new double[d]; // E[X^2]
+                for (int i = 0; i < nEM; i++) {
+                    double rij = responsibilities[i][j];
+                    for (int dd = 0; dd < d; dd++) {
+                        newMean[dd] += rij * emData[i][dd];
+                        eMeanSq[dd] += rij * emDataSq[i][dd];
+                    }
+                }
+                for (int dd = 0; dd < d; dd++) {
+                    double mu = newMean[dd] / nkj;
+                    means[j][dd] = (float) mu;
+                    // Var = E[X^2] - E[X]^2
+                    variances[j][dd] = (float) Math.max(eMeanSq[dd] / nkj - mu * mu, MIN_VARIANCE);
+                }
+            }
+
+            // Relative convergence check
+            if (Math.abs(totalLogLikelihood - prevLogLikelihood) / Math.max(Math.abs(totalLogLikelihood), 1.0)
+                < EM_CONVERGENCE_THRESHOLD) {
                 break;
             }
-            prevLogLikelihood = logLikelihood;
+            prevLogLikelihood = totalLogLikelihood;
         }
 
         return new GmmCoreset(d, weights, means, variances);
+    }
+
+    private static final double LOG_2PI = Math.log(2 * Math.PI);
+
+    /** Subsample embeddings using Fisher-Yates partial shuffle. */
+    private static float[][] subsample(float[][] embeddings, int n, Random rng) {
+        int total = embeddings.length;
+        int[] indices = new int[total];
+        for (int i = 0; i < total; i++) {
+            indices[i] = i;
+        }
+        float[][] result = new float[n][];
+        for (int i = 0; i < n; i++) {
+            int j = i + rng.nextInt(total - i);
+            int tmp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = tmp;
+            result[i] = embeddings[indices[i]];
+        }
+        return result;
     }
 
     /** k-means++ centre initialisation. */
@@ -177,88 +297,11 @@ public class GmmCoreset implements GeometricCoreset {
         return centres;
     }
 
-    /** E-step: compute responsibilities and return total log-likelihood. */
-    private static double eStep(float[][] embeddings, float[][] means, float[][] variances, float[] weights, double[][] responsibilities) {
-        int n = embeddings.length;
-        int k = weights.length;
-        double totalLogLikelihood = 0;
-
-        for (int i = 0; i < n; i++) {
-            double[] logResp = new double[k];
-            double maxLog = Double.NEGATIVE_INFINITY;
-
-            for (int j = 0; j < k; j++) {
-                logResp[j] = Math.log(weights[j] + 1e-300) + logGaussianDiag(embeddings[i], means[j], variances[j]);
-                if (logResp[j] > maxLog) {
-                    maxLog = logResp[j];
-                }
-            }
-
-            // Log-sum-exp for numerical stability
-            double logSum = 0;
-            for (int j = 0; j < k; j++) {
-                logSum += Math.exp(logResp[j] - maxLog);
-            }
-            logSum = maxLog + Math.log(logSum);
-            totalLogLikelihood += logSum;
-
-            for (int j = 0; j < k; j++) {
-                responsibilities[i][j] = Math.exp(logResp[j] - logSum);
-            }
-        }
-        return totalLogLikelihood;
-    }
-
-    /** M-step: update means, variances, and weights from responsibilities. */
-    private static void mStep(
-        float[][] embeddings,
-        double[][] responsibilities,
-        float[][] means,
-        float[][] variances,
-        float[] weights,
-        int d,
-        int k
-    ) {
-        int n = embeddings.length;
-        double[] nk = new double[k];
-
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < k; j++) {
-                nk[j] += responsibilities[i][j];
-            }
-        }
-
-        for (int j = 0; j < k; j++) {
-            double nkj = Math.max(nk[j], 1e-10);
-            weights[j] = (float) (nk[j] / n);
-
-            // Update mean
-            double[] newMean = new double[d];
-            for (int i = 0; i < n; i++) {
-                for (int dd = 0; dd < d; dd++) {
-                    newMean[dd] += responsibilities[i][j] * embeddings[i][dd];
-                }
-            }
-            for (int dd = 0; dd < d; dd++) {
-                means[j][dd] = (float) (newMean[dd] / nkj);
-            }
-
-            // Update diagonal variance
-            double[] newVar = new double[d];
-            for (int i = 0; i < n; i++) {
-                for (int dd = 0; dd < d; dd++) {
-                    double diff = embeddings[i][dd] - means[j][dd];
-                    newVar[dd] += responsibilities[i][j] * diff * diff;
-                }
-            }
-            for (int dd = 0; dd < d; dd++) {
-                variances[j][dd] = (float) Math.max(newVar[dd] / nkj, MIN_VARIANCE);
-            }
-        }
-    }
-
-    /** Log-density of a diagonal Gaussian at point {@code x}. */
-    private static double logGaussianDiag(float[] x, float[] mean, float[] variance) {
+    /**
+     * Log-density of a diagonal Gaussian at point {@code x}.
+     * Used for single-point scoring (novelty detection).
+     */
+    static double logGaussianDiag(float[] x, float[] mean, float[] variance) {
         int d = x.length;
         double logDet = 0;
         double mahal = 0;
@@ -268,7 +311,81 @@ public class GmmCoreset implements GeometricCoreset {
             double diff = x[i] - mean[i];
             mahal += diff * diff / v;
         }
-        return -0.5 * (d * Math.log(2 * Math.PI) + logDet + mahal);
+        return -0.5 * (d * LOG_2PI + logDet + mahal);
+    }
+
+    /**
+     * Computes the log-likelihood of a single point under this GMM.
+     * Used by the novelty detector for per-sample novelty scoring.
+     *
+     * @param x embedding vector of length {@code dimension}
+     * @return log p(x | GMM)
+     */
+    public double logLikelihood(float[] x) {
+        int k = weights.length;
+        double maxLog = Double.NEGATIVE_INFINITY;
+        double[] logResp = new double[k];
+        for (int j = 0; j < k; j++) {
+            logResp[j] = Math.log(weights[j] + 1e-300) + logGaussianDiag(x, means[j], variances[j]);
+            if (logResp[j] > maxLog) {
+                maxLog = logResp[j];
+            }
+        }
+        double sum = 0;
+        for (int j = 0; j < k; j++) {
+            sum += Math.exp(logResp[j] - maxLog);
+        }
+        return maxLog + Math.log(sum);
+    }
+
+    /**
+     * Computes log-likelihoods for a batch of points under this GMM.
+     * Amortises JIT overhead and enables cache-friendly access patterns.
+     *
+     * @param batch array of embedding vectors, each of length {@code dimension}
+     * @return array of log p(x | GMM) for each input
+     */
+    public double[] batchLogLikelihood(float[][] batch) {
+        int m = batch.length;
+        int k = weights.length;
+        int d = dimension;
+
+        // Precompute per-component constants
+        double[] invVar = new double[k * d];
+        double[] logConst = new double[k];
+        for (int j = 0; j < k; j++) {
+            double logDet = 0;
+            for (int dd = 0; dd < d; dd++) {
+                double v = Math.max(variances[j][dd], MIN_VARIANCE);
+                invVar[j * d + dd] = 1.0 / v;
+                logDet += Math.log(v);
+            }
+            logConst[j] = Math.log(weights[j] + 1e-300) - 0.5 * (d * LOG_2PI + logDet);
+        }
+
+        double[] result = new double[m];
+        for (int i = 0; i < m; i++) {
+            double maxLog = Double.NEGATIVE_INFINITY;
+            double[] lr = new double[k];
+            for (int j = 0; j < k; j++) {
+                double mahal = 0;
+                int base = j * d;
+                for (int dd = 0; dd < d; dd++) {
+                    double diff = batch[i][dd] - means[j][dd];
+                    mahal += diff * diff * invVar[base + dd];
+                }
+                lr[j] = logConst[j] - 0.5 * mahal;
+                if (lr[j] > maxLog) {
+                    maxLog = lr[j];
+                }
+            }
+            double sum = 0;
+            for (int j = 0; j < k; j++) {
+                sum += Math.exp(lr[j] - maxLog);
+            }
+            result[i] = maxLog + Math.log(sum);
+        }
+        return result;
     }
 
     private static double squaredEuclidean(float[] a, float[] b) {
@@ -347,6 +464,16 @@ public class GmmCoreset implements GeometricCoreset {
             logDetRatio += Math.log(avgVar) - 0.5 * Math.log(v1) - 0.5 * Math.log(v2);
         }
         return Math.exp(-0.125 * mahal - 0.5 * logDetRatio);
+    }
+
+    @Override
+    public double scoreSample(float[] embedding) {
+        return logLikelihood(embedding);
+    }
+
+    @Override
+    public double[] batchScoreSamples(float[][] batch) {
+        return batchLogLikelihood(batch);
     }
 
     /** Centroid-distance proxy overlap for cross-type comparisons. */

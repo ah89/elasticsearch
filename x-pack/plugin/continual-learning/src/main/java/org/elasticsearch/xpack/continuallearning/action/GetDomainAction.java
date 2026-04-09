@@ -57,7 +57,7 @@ public class GetDomainAction extends ActionType<GetDomainAction.Response> {
 
         /** List-all request. */
         public Request() {
-            this(null);
+            this((String) null);
         }
 
         public Request(StreamInput in) throws IOException {

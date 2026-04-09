@@ -77,4 +77,51 @@ public interface GeometricCoreset extends NamedWriteable, ToXContentObject {
      * @return list of {@code count} negative embedding vectors
      */
     List<float[]> sampleBoundaryNegatives(float[] targetCentroid, int count, float margin);
+
+    /**
+     * Computes a familiarity score for a single embedding.
+     * Higher values indicate the embedding is more likely to belong to this domain.
+     *
+     * <p>The default implementation delegates to {@link #computeOverlap} via a
+     * single-centroid proxy coreset.  Concrete implementations should override
+     * this with type-specific efficient scoring.
+     *
+     * @param embedding the query embedding vector
+     * @return familiarity score (higher = more familiar / less novel)
+     */
+    default double scoreSample(float[] embedding) {
+        // Default: cosine similarity to nearest centroid
+        List<float[]> centroids = getCentroids();
+        double maxSim = Double.NEGATIVE_INFINITY;
+        for (float[] centroid : centroids) {
+            double dot = 0, normA = 0, normB = 0;
+            for (int i = 0; i < embedding.length; i++) {
+                dot += (double) embedding[i] * centroid[i];
+                normA += (double) embedding[i] * embedding[i];
+                normB += (double) centroid[i] * centroid[i];
+            }
+            double denom = Math.sqrt(normA) * Math.sqrt(normB);
+            double sim = denom < 1e-12 ? 0 : dot / denom;
+            if (sim > maxSim) {
+                maxSim = sim;
+            }
+        }
+        return maxSim;
+    }
+
+    /**
+     * Batch-scores multiple embeddings for familiarity with this domain.
+     * The default implementation calls {@link #scoreSample} per element.
+     * Concrete implementations should override for amortised performance.
+     *
+     * @param batch array of embedding vectors
+     * @return array of familiarity scores, one per input
+     */
+    default double[] batchScoreSamples(float[][] batch) {
+        double[] scores = new double[batch.length];
+        for (int i = 0; i < batch.length; i++) {
+            scores[i] = scoreSample(batch[i]);
+        }
+        return scores;
+    }
 }
