@@ -133,4 +133,103 @@ public class NoveltyDetector {
     public float adjustedThresholdForJL(float epsilonJL) {
         return Math.max(0.0f, threshold - 2.0f * epsilonJL);
     }
+
+    // =========================================================================
+    // Per-sample novelty scoring via Fisher Discriminant Gap
+    // =========================================================================
+
+    /**
+     * Computes the Fisher Discriminant Gap novelty score for a single embedding
+     * against all existing domain coresets.
+     *
+     * <p>The Fisher Gap cancels the "ambient density" contribution that arises from
+     * concentration of measure in high-dimensional ViT embedding spaces (d ≫ 1).
+     * For each sample x, instead of using the raw maximum log-likelihood across
+     * tasks, we compute:
+     *
+     * <pre>
+     *   FisherGap(x) = max_j [LL_j(x) − mean_{i≠j} LL_i(x)]
+     * </pre>
+     *
+     * <p>This is equivalent to projecting onto the first Fisher discriminant direction
+     * in the T-dimensional space of per-task log-likelihoods.  The ambient LL term
+     * (which is approximately constant across tasks due to concentration of measure)
+     * cancels, isolating the task-discriminative signal.
+     *
+     * <p>For novel samples, even when one task's GMM gives high LL (absorption), the
+     * Fisher Gap is small because other tasks give similarly high LL.  For known
+     * samples from the correct task, the Fisher Gap is large because one task's GMM
+     * is distinctively better.
+     *
+     * @param embedding       the query embedding vector
+     * @param existingDomains list of coresets for all previously seen domains
+     * @return Fisher Gap score; higher = more likely to belong to an existing domain
+     *         (i.e. LESS novel)
+     */
+    public float computeFisherGap(float[] embedding, List<GeometricCoreset> existingDomains) {
+        if (existingDomains.isEmpty()) {
+            return 0f;
+        }
+        int T = existingDomains.size();
+        double[] scores = new double[T];
+        double sumScores = 0;
+        for (int j = 0; j < T; j++) {
+            scores[j] = existingDomains.get(j).scoreSample(embedding);
+            sumScores += scores[j];
+        }
+        if (T == 1) {
+            return (float) scores[0];
+        }
+        // Fisher gap: max_j [score_j - mean_{i≠j} score_i]
+        double bestGap = Double.NEGATIVE_INFINITY;
+        for (int j = 0; j < T; j++) {
+            double meanOthers = (sumScores - scores[j]) / (T - 1);
+            double gap = scores[j] - meanOthers;
+            if (gap > bestGap) {
+                bestGap = gap;
+            }
+        }
+        return (float) bestGap;
+    }
+
+    /**
+     * Batch version of {@link #computeFisherGap} for multiple embeddings.
+     *
+     * @param embeddings      array of query embedding vectors
+     * @param existingDomains list of coresets for all previously seen domains
+     * @return array of Fisher Gap scores, one per embedding
+     */
+    public float[] batchFisherGap(float[][] embeddings, List<GeometricCoreset> existingDomains) {
+        if (existingDomains.isEmpty()) {
+            float[] result = new float[embeddings.length];
+            return result;
+        }
+        int T = existingDomains.size();
+        int m = embeddings.length;
+
+        // Compute per-task scores for all embeddings
+        double[][] perTaskScores = new double[T][];
+        for (int j = 0; j < T; j++) {
+            perTaskScores[j] = existingDomains.get(j).batchScoreSamples(embeddings);
+        }
+
+        // Compute Fisher gap for each embedding
+        float[] result = new float[m];
+        for (int i = 0; i < m; i++) {
+            double sum = 0;
+            for (int j = 0; j < T; j++) {
+                sum += perTaskScores[j][i];
+            }
+            double bestGap = Double.NEGATIVE_INFINITY;
+            for (int j = 0; j < T; j++) {
+                double meanOthers = (sum - perTaskScores[j][i]) / (T - 1);
+                double gap = perTaskScores[j][i] - meanOthers;
+                if (gap > bestGap) {
+                    bestGap = gap;
+                }
+            }
+            result[i] = (float) bestGap;
+        }
+        return result;
+    }
 }
