@@ -23,8 +23,8 @@ public class PrefixLayout {
             return dimension;
         }
         int raw = Math.round(dimension * PREFIX_RATIO);
-        int rounded = ((raw + BLOCK_SIZE -1) / BLOCK_SIZE) * BLOCK_SIZE;
-        return Math.max(rounded, dimension);
+        int rounded = ((raw + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+        return Math.min(rounded, dimension);
     }
 
     public static boolean isEnabled(int dimension) {
@@ -38,9 +38,7 @@ public class PrefixLayout {
     public static void copyPrefix(float[] vector, float[] out) {
         int expected = prefixLength(vector.length);
         if (out.length != expected) {
-            throw new IllegalArgumentException(
-                "out length [" + out.length + "] does not match prefix length [" + expected + "]"
-            );
+            throw new IllegalArgumentException("out length [" + out.length + "] does not match prefix length [" + expected + "]");
         }
         System.arraycopy(vector, 0, out, 0, expected);
     }
@@ -48,9 +46,7 @@ public class PrefixLayout {
     public static void copySuffix(float[] vector, float[] out) {
         int expected = suffixLength(vector.length);
         if (out.length != expected) {
-            throw new IllegalArgumentException(
-                "out length [" + out.length + "] does not match suffix length [" + expected + "]"
-            );
+            throw new IllegalArgumentException("out length [" + out.length + "] does not match suffix length [" + expected + "]");
         }
         System.arraycopy(vector, prefixLength(vector.length), out, 0, expected);
     }
