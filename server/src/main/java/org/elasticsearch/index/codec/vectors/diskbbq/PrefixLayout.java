@@ -30,4 +30,28 @@ public class PrefixLayout {
     public static boolean isEnabled(int dimension) {
         return prefixLength(dimension) < dimension;
     }
+
+    public static int suffixLength(int dimension) {
+        return dimension - prefixLength(dimension);
+    }
+
+    public static void copyPrefix(float[] vector, float[] out) {
+        int expected = prefixLength(vector.length);
+        if (out.length != expected) {
+            throw new IllegalArgumentException(
+                "out length [" + out.length + "] does not match prefix length [" + expected + "]"
+            );
+        }
+        System.arraycopy(vector, 0, out, 0, expected);
+    }
+
+    public static void copySuffix(float[] vector, float[] out) {
+        int expected = suffixLength(vector.length);
+        if (out.length != expected) {
+            throw new IllegalArgumentException(
+                "out length [" + out.length + "] does not match suffix length [" + expected + "]"
+            );
+        }
+        System.arraycopy(vector, prefixLength(vector.length), out, 0, expected);
+    }
 }
