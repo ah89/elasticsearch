@@ -59,7 +59,10 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
 
     public static final int VERSION_START = 1;
     public static final int VERSION_DIRECT_IO = VERSION_START;
-    public static final int VERSION_CURRENT = VERSION_START;
+    // Reserves a version for the upcoming centroid prefix/suffix split layout.
+    // Writer stamps this version immediately; the on-disk layout change lands in a follow-up commit.
+    public static final int VERSION_PREFIX_SPLIT_CENTROIDS = 2;
+    public static final int VERSION_CURRENT = VERSION_PREFIX_SPLIT_CENTROIDS;
     public static final float DYNAMIC_VISIT_RATIO = 0.0f;
 
     private static final DirectIOCapableFlatVectorsFormat float32VectorFormat = new DirectIOCapableLucene99FlatVectorsFormat(
