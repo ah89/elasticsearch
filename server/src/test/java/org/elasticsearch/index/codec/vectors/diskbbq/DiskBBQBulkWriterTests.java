@@ -43,6 +43,73 @@ public class DiskBBQBulkWriterTests extends ESTestCase {
         }
     }
 
+    public void testLargeBitBytesPerVectorFormula() throws IOException {
+        // The encoded constant the LargeBit writer reports must equal the actual per-vector cost
+        // on disk: dim bytes + 3 floats + 1 int = dim + 16. Region-sizing logic in the writers
+        // depends on this exact identity.
+        int dim = randomIntBetween(1, 1024);
+        try (IndexOutput out = new ByteBuffersIndexOutput(new ByteBuffersDataOutput(), "test", "test")) {
+            DiskBBQBulkWriter writer = DiskBBQBulkWriter.fromBitSize(7, 32, out);
+            assertEquals(dim + 3 * Float.BYTES + Integer.BYTES, writer.bytesPerVector(dim));
+        }
+    }
+
+    public void testLargeBitFilePointerDeltaMatchesBytesPerVector() throws IOException {
+        // The writer must produce exactly count * bytesPerVector(dim) bytes regardless of how
+        // the count splits across bulks and tail. Cover both the non-encoded LargeBit writer
+        // (per-vector tail) and the encoded LargeBit writer (block-encoded tail). Try several
+        // counts: zero, less than bulkSize, exactly bulkSize, several full bulks, and counts
+        // that leave non-trivial tails.
+        int dim = randomIntBetween(2, 256);
+        int bulkSize = randomIntBetween(2, 32);
+        int[] counts = new int[] { 0, 1, bulkSize - 1, bulkSize, bulkSize + 1, 2 * bulkSize, 2 * bulkSize + (bulkSize / 2 + 1) };
+        for (boolean encoded : new boolean[] { false, true }) {
+            for (int count : counts) {
+                ByteBuffersDataOutput buffer = new ByteBuffersDataOutput();
+                long pointerBefore;
+                long pointerAfter;
+                long expected;
+                try (IndexOutput out = new ByteBuffersIndexOutput(buffer, "diskbbq", "diskbbq")) {
+                    DiskBBQBulkWriter writer = encoded
+                        ? DiskBBQBulkWriter.fromBitSize(7, bulkSize, out, true, true)
+                        : DiskBBQBulkWriter.fromBitSize(7, bulkSize, out);
+                    pointerBefore = out.getFilePointer();
+                    expected = (long) count * writer.bytesPerVector(dim);
+                    writer.writeVectors(buildRandomQvv(count, dim), null);
+                    pointerAfter = out.getFilePointer();
+                }
+                long written = pointerAfter - pointerBefore;
+                assertEquals("encoded=" + encoded + " count=" + count + " bulkSize=" + bulkSize + " dim=" + dim, expected, written);
+            }
+        }
+    }
+
+    public void testSmallBitBytesPerVectorIsUnsupported() throws IOException {
+        // SmallBit encodings opt out of bytesPerVector for now; callers that wire the writer into
+        // a region-sizing path get a fail-fast UnsupportedOperationException instead of silently
+        // wrong arithmetic.
+        int bits = randomFrom(new Integer[] { 1, 2, 4 });
+        try (IndexOutput out = new ByteBuffersIndexOutput(new ByteBuffersDataOutput(), "test", "test")) {
+            DiskBBQBulkWriter writer = DiskBBQBulkWriter.fromBitSize(bits, 32, out);
+            expectThrows(UnsupportedOperationException.class, () -> writer.bytesPerVector(128));
+        }
+    }
+
+    private TestQuantizedVectorValues buildRandomQvv(int count, int dim) {
+        byte[][] vectors = new byte[count][dim];
+        OptimizedScalarQuantizer.QuantizationResult[] corrections = new OptimizedScalarQuantizer.QuantizationResult[count];
+        for (int i = 0; i < count; i++) {
+            random().nextBytes(vectors[i]);
+            corrections[i] = new OptimizedScalarQuantizer.QuantizationResult(
+                randomFloat(),
+                randomFloat(),
+                randomFloat(),
+                randomIntBetween(0, 200_000)
+            );
+        }
+        return new TestQuantizedVectorValues(vectors, corrections);
+    }
+
     private void assertLargeBitEncoding(int bits) throws IOException {
         int dimensions = randomIntBetween(2, 64);
         int bulkSize = randomIntBetween(2, 16);

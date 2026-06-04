@@ -53,6 +53,8 @@ import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsWriter;
 import org.elasticsearch.index.codec.vectors.diskbbq.IntSorter;
 import org.elasticsearch.index.codec.vectors.diskbbq.IntToBooleanFunction;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
+import org.elasticsearch.index.codec.vectors.diskbbq.PrefixLayout;
+import org.elasticsearch.index.codec.vectors.diskbbq.PrefixQuantizedCentroids;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedVectorValues;
 import org.elasticsearch.index.codec.vectors.diskbbq.TieredMergeStrategy;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
@@ -803,15 +805,67 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
             offset += centroidVectors.length;
         }
 
-        QuantizedCentroids childrenQuantizeCentroid = new QuantizedCentroids(
-            centroidSupplier,
-            fieldInfo.getVectorDimension(),
-            osq,
-            globalCentroid
-        );
-        for (int[] centroidVectors : centroidGroups.vectors()) {
-            childrenQuantizeCentroid.reset(idx -> centroidVectors[idx], centroidVectors.length);
-            bulkWriter.writeVectors(childrenQuantizeCentroid, null);
+        final int dimension = fieldInfo.getVectorDimension();
+        if (PrefixLayout.isEnabled(dimension)) {
+            // v2 split layout for the children section: drain prefixes for every parent group into
+            // the prefix region first, then drain suffixes into the suffix region. We reuse a
+            // single DiskBBQBulkWriter — it holds no cross-call framing state (no flush/finish/
+            // close; bytes are written eagerly inside writeVectors), so successive writeVectors
+            // calls land back-to-back on disk.
+            PrefixQuantizedCentroids childrenSplit = new PrefixQuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);
+            // PrefixLayout.isEnabled(dimension) implies suffixLength(dimension) > 0, which implies
+            // PrefixQuantizedCentroids#suffixView() != null. Guard the cross-class invariant
+            // explicitly so any future drift fails here with a clear message instead of a bare NPE
+            // inside DiskBBQBulkWriter#writeVectors.
+            QuantizedVectorValues suffixView = Objects.requireNonNull(
+                childrenSplit.suffixView(),
+                "PrefixLayout.isEnabled(" + dimension + ") but PrefixQuantizedCentroids.suffixView() is null"
+            );
+            final long prefixStart = centroidOutput.getFilePointer();
+            long writtenCount = 0;
+            for (int[] centroidVectors : centroidGroups.vectors()) {
+                childrenSplit.reset(idx -> centroidVectors[idx], centroidVectors.length);
+                bulkWriter.writeVectors(childrenSplit.prefixView(), null);
+                writtenCount += centroidVectors.length;
+            }
+            // Required invariant: every centroid lives in exactly one parent group, so the sum of
+            // group sizes must equal the total centroid count. If grouping ever changes (missing
+            // or duplicated ords), surface it here instead of producing a corrupt centroid file.
+            if (writtenCount != centroidSupplier.size()) {
+                throw new IOException(
+                    "with-parents children count mismatch: groups summed to ["
+                        + writtenCount
+                        + "] but supplier has ["
+                        + centroidSupplier.size()
+                        + "] centroids"
+                );
+            }
+            final int prefixLen = PrefixLayout.prefixLength(dimension);
+            final long prefixWritten = centroidOutput.getFilePointer() - prefixStart;
+            final long prefixExpected = writtenCount * bulkWriter.bytesPerVector(prefixLen);
+            if (prefixWritten != prefixExpected) {
+                throw new IOException(
+                    "prefix region size mismatch: expected ["
+                        + prefixExpected
+                        + "] but wrote ["
+                        + prefixWritten
+                        + "] for "
+                        + writtenCount
+                        + " centroids, prefixLen="
+                        + prefixLen
+                );
+            }
+            for (int[] centroidVectors : centroidGroups.vectors()) {
+                childrenSplit.reset(idx -> centroidVectors[idx], centroidVectors.length);
+                bulkWriter.writeVectors(suffixView, null);
+            }
+        } else {
+            // small-dim fallback: keep the old single contiguous quantized children section.
+            QuantizedCentroids childrenQuantizeCentroid = new QuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);
+            for (int[] centroidVectors : centroidGroups.vectors()) {
+                childrenQuantizeCentroid.reset(idx -> centroidVectors[idx], centroidVectors.length);
+                bulkWriter.writeVectors(childrenQuantizeCentroid, null);
+            }
         }
         // write the centroid offsets at the end of the file
         int parentOrd = 0;
@@ -836,22 +890,57 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
     ) throws IOException {
         centroidOutput.writeVInt(0);
         writeSlicesOffsets(centroidOutput, centroidSupplier.slices());
-        DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(7, BULK_SIZE, centroidOutput, true, true);
         final OptimizedScalarQuantizer osq = new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction());
-        QuantizedCentroids quantizedCentroids = new QuantizedCentroids(
-            centroidSupplier,
-            fieldInfo.getVectorDimension(),
-            osq,
-            globalCentroid
-        );
-        bulkWriter.writeVectors(quantizedCentroids, null);
+        final int dimension = fieldInfo.getVectorDimension();
+        // Reuse a single DiskBBQBulkWriter for both regions. The writer holds no cross-call framing
+        // state (no flush/finish/close; every byte is written eagerly to the IndexOutput inside
+        // writeVectors), so successive writeVectors calls land back-to-back in the centroid file.
+        DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(7, BULK_SIZE, centroidOutput, true, true);
+        if (PrefixLayout.isEnabled(dimension)) {
+            // v2 split layout: write the prefix region first, then the suffix region. Both regions
+            // are sized exactly numCentroids * bulkWriter.bytesPerVector(halfDim) bytes thanks to
+            // bulk encoding, so the reader can compute the suffix region offset without any extra
+            // header field.
+            PrefixQuantizedCentroids split = new PrefixQuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);
+            // See writeCentroidsWithParents for the rationale: guard the cross-class invariant
+            // "PrefixLayout.isEnabled(dim) ⇒ suffixView() != null" so any future drift fails here
+            // with a clear message instead of a bare NPE inside writeVectors.
+            QuantizedVectorValues suffixView = Objects.requireNonNull(
+                split.suffixView(),
+                "PrefixLayout.isEnabled(" + dimension + ") but PrefixQuantizedCentroids.suffixView() is null"
+            );
+            final long prefixStart = centroidOutput.getFilePointer();
+            final int numCentroids = centroidSupplier.size();
+            bulkWriter.writeVectors(split.prefixView(), null);
+            final int prefixLen = PrefixLayout.prefixLength(dimension);
+            final long prefixWritten = centroidOutput.getFilePointer() - prefixStart;
+            final long prefixExpected = (long) numCentroids * bulkWriter.bytesPerVector(prefixLen);
+            if (prefixWritten != prefixExpected) {
+                throw new IOException(
+                    "prefix region size mismatch: expected ["
+                        + prefixExpected
+                        + "] but wrote ["
+                        + prefixWritten
+                        + "] for "
+                        + numCentroids
+                        + " centroids, prefixLen="
+                        + prefixLen
+                );
+            }
+            bulkWriter.writeVectors(suffixView, null);
+        } else {
+            // small-dim fallback: prefix == full vector, no suffix region. Keep the existing single
+            // contiguous quantized section. v2 readers handle this by treating prefixLen == dim.
+            QuantizedCentroids quantizedCentroids = new QuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);
+            bulkWriter.writeVectors(quantizedCentroids, null);
+        }
         // write the centroid offsets at the end of the file
         for (int i = 0; i < centroidSupplier.size(); i++) {
             centroidOutput.writeLong(centroidOffsetAndLength.offsets().get(i));
             centroidOutput.writeLong(centroidOffsetAndLength.lengths().get(i));
         }
         // write raw centroids for merge strategy centroid reuse
-        writeRawCentroids(centroidOutput, centroidSupplier, fieldInfo.getVectorDimension());
+        writeRawCentroids(centroidOutput, centroidSupplier, dimension);
     }
 
     private static void writeRawCentroids(IndexOutput centroidOutput, CentroidSupplier centroidSupplier, int dimension) throws IOException {

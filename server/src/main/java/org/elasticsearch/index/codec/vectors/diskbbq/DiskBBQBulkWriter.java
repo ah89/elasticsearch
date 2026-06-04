@@ -38,6 +38,18 @@ public abstract sealed class DiskBBQBulkWriter {
     public abstract void writeVectors(QuantizedVectorValues qvv, CheckedIntConsumer<IOException> docsWriter) throws IOException;
 
     /**
+     * Number of bytes written per vector for the configured encoding, given a vector dimension.
+     * Callers use this to compute on-disk region sizes without hard-coding the per-vector layout
+     * (which would silently drift if the encoding changes).
+     *
+     * <p>The default throws because not every encoding has implemented this yet. Override in the
+     * concrete subclass for any encoding that needs region sizing (currently only LargeBit/7-bit).
+     */
+    public int bytesPerVector(int dimension) {
+        throw new UnsupportedOperationException("bytesPerVector is not implemented for " + getClass().getSimpleName());
+    }
+
+    /**
      * Factory method to create a DiskBBQBulkWriter based on the bit size.
      * @param bitSize the bit size of the quantized vectors
      * @param bulkSize the number of vectors to write in bulk
@@ -153,6 +165,14 @@ public abstract sealed class DiskBBQBulkWriter {
         private LargeBitDiskBBQBulkWriter(int bulkSize, IndexOutput out) {
             super(bulkSize, out);
             this.corrections = new OptimizedScalarQuantizer.QuantizationResult[bulkSize];
+        }
+
+        @Override
+        public int bytesPerVector(int dimension) {
+            // 7-bit LargeBit layout: one byte per dimension followed by a fixed correction footer
+            // of three floats (lowerInterval, upperInterval, additionalCorrection) and one int
+            // (quantizedComponentSum). Inherited by LargeBitEncodedDiskBBQBulkWriter.
+            return dimension + 3 * Float.BYTES + Integer.BYTES;
         }
 
         @Override

@@ -9,9 +9,11 @@
 
 package org.elasticsearch.index.codec.vectors.diskbbq;
 
+import org.apache.lucene.util.hnsw.IntToIntFunction;
 import org.elasticsearch.index.codec.vectors.OptimizedScalarQuantizer;
 
 import java.io.IOException;
+import java.util.Objects;
 
 /**
  * Quantizes each centroid as two independent halves: a prefix half and a suffix half.
@@ -36,13 +38,9 @@ public final class PrefixQuantizedCentroids {
 
     private final HalfView prefixView;
     private final HalfView suffixView;
+    private final int supplierSize;
 
-    public PrefixQuantizedCentroids(
-        CentroidSupplier supplier,
-        int dimension,
-        OptimizedScalarQuantizer quantizer,
-        float[] globalCentroid
-    ) {
+    public PrefixQuantizedCentroids(CentroidSupplier supplier, int dimension, OptimizedScalarQuantizer quantizer, float[] globalCentroid) {
         if (globalCentroid.length != dimension) {
             throw new IllegalArgumentException(
                 "globalCentroid length [" + globalCentroid.length + "] does not match dimension [" + dimension + "]"
@@ -62,6 +60,7 @@ public final class PrefixQuantizedCentroids {
             PrefixLayout.copySuffix(globalCentroid, globalSuffix);
             this.suffixView = new HalfView(supplier, quantizer, prefixLen, suffixLen, globalSuffix);
         }
+        this.supplierSize = supplier.size();
     }
 
     /**
@@ -81,6 +80,32 @@ public final class PrefixQuantizedCentroids {
     }
 
     /**
+     * Reset both prefix and suffix views to iterate a subset of the supplier's centroids in a given order.
+     * Mirrors {@code QuantizedCentroids#reset(IntToIntFunction, int)} so callers can reuse a
+     * single instance across multiple parent groups in the with-parents writing path.
+     *
+     * <p>After {@code reset}, both {@link #prefixView()} and {@link #suffixView()} restart from
+     * the beginning and report {@code count() == size}.
+     *
+     * @param ordTransformer maps an iteration index {@code [0, size)} to a centroid ordinal in
+     *                       the underlying supplier; must not be {@code null}.
+     * @param size           number of iterations to expose; must satisfy
+     *                       {@code 0 <= size <= supplier.size()}.
+     * @throws NullPointerException     if {@code ordTransformer} is {@code null}.
+     * @throws IllegalArgumentException if {@code size} is out of range.
+     */
+    public void reset(IntToIntFunction ordTransformer, int size) {
+        Objects.requireNonNull(ordTransformer, "ordTransformer");
+        if (size < 0 || size > supplierSize) {
+            throw new IllegalArgumentException("size [" + size + "] must be in [0, " + supplierSize + "] (supplier.size())");
+        }
+        prefixView.reset(ordTransformer, size);
+        if (suffixView != null) {
+            suffixView.reset(ordTransformer, size);
+        }
+    }
+
+    /**
      * Single-pass quantized view over one fixed slice ({@code offset .. offset+length}) of each
      * centroid produced by the underlying supplier.
      */
@@ -95,6 +120,8 @@ public final class PrefixQuantizedCentroids {
         private final int[] quantizedIntScratch;
         private final byte[] quantizedBytes;
         private int currOrd = -1;
+        private int size;
+        private IntToIntFunction ordTransformer = i -> i;
         private OptimizedScalarQuantizer.QuantizationResult corrections;
 
         HalfView(CentroidSupplier supplier, OptimizedScalarQuantizer quantizer, int offset, int length, float[] globalHalf) {
@@ -107,11 +134,19 @@ public final class PrefixQuantizedCentroids {
             this.residualScratch = new float[length];
             this.quantizedIntScratch = new int[length];
             this.quantizedBytes = new byte[length];
+            this.size = supplier.size();
+        }
+
+        void reset(IntToIntFunction ordTransformer, int size) {
+            this.ordTransformer = ordTransformer;
+            this.size = size;
+            this.currOrd = -1;
+            this.corrections = null;
         }
 
         @Override
         public int count() {
-            return supplier.size();
+            return size;
         }
 
         @Override
@@ -120,7 +155,7 @@ public final class PrefixQuantizedCentroids {
                 throw new IllegalStateException("No more vectors to read, current ord: " + currOrd + ", count: " + count());
             }
             currOrd++;
-            float[] full = supplier.centroid(currOrd);
+            float[] full = supplier.centroid(ordTransformer.apply(currOrd));
             System.arraycopy(full, offset, sliceScratch, 0, length);
             corrections = quantizer.scalarQuantize(sliceScratch, residualScratch, quantizedIntScratch, (byte) 7, globalHalf);
             for (int i = 0; i < length; i++) {
@@ -135,4 +170,3 @@ public final class PrefixQuantizedCentroids {
         }
     }
 }
-

@@ -10,6 +10,7 @@
 package org.elasticsearch.index.codec.vectors.diskbbq;
 
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.util.hnsw.IntToIntFunction;
 import org.elasticsearch.index.codec.vectors.OptimizedScalarQuantizer;
 import org.elasticsearch.index.codec.vectors.cluster.KMeansResult;
 import org.elasticsearch.test.ESTestCase;
@@ -156,6 +157,75 @@ public class PrefixQuantizedCentroidsTests extends ESTestCase {
         expectThrows(IllegalArgumentException.class, () -> new PrefixQuantizedCentroids(supplier, dim, quantizer, wrongLengthGlobal));
     }
 
+    public void testResetRejectsNullOrdTransformer() {
+        int dim = 512;
+        int numCentroids = 4;
+        OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(VectorSimilarityFunction.EUCLIDEAN);
+        CentroidSupplier supplier = CentroidSupplier.fromArray(randomCentroids(numCentroids, dim), KMeansResult.emptyFloat(), dim);
+        PrefixQuantizedCentroids split = new PrefixQuantizedCentroids(supplier, dim, quantizer, randomFloatVector(dim));
+        expectThrows(NullPointerException.class, () -> split.reset(null, 1));
+    }
+
+    public void testResetRejectsOutOfRangeSize() {
+        int dim = 512;
+        int numCentroids = 4;
+        OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(VectorSimilarityFunction.EUCLIDEAN);
+        CentroidSupplier supplier = CentroidSupplier.fromArray(randomCentroids(numCentroids, dim), KMeansResult.emptyFloat(), dim);
+        PrefixQuantizedCentroids split = new PrefixQuantizedCentroids(supplier, dim, quantizer, randomFloatVector(dim));
+        expectThrows(IllegalArgumentException.class, () -> split.reset(i -> i, -1));
+        expectThrows(IllegalArgumentException.class, () -> split.reset(i -> i, numCentroids + 1));
+    }
+
+    public void testResetAcceptsBoundaryValues() {
+        int dim = 512;
+        int numCentroids = 4;
+        OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(VectorSimilarityFunction.EUCLIDEAN);
+        CentroidSupplier supplier = CentroidSupplier.fromArray(randomCentroids(numCentroids, dim), KMeansResult.emptyFloat(), dim);
+        PrefixQuantizedCentroids split = new PrefixQuantizedCentroids(supplier, dim, quantizer, randomFloatVector(dim));
+        // size == 0 and size == supplier.size() are both legal.
+        split.reset(i -> i, 0);
+        assertEquals(0, split.prefixView().count());
+        split.reset(i -> i, numCentroids);
+        assertEquals(numCentroids, split.prefixView().count());
+    }
+
+    public void testResetWorksWhenSuffixViewIsNull() throws Exception {
+        // Pick a dimension below the split threshold so suffixView() == null. reset() must still
+        // succeed (no NPE on the missing suffix) and the prefix view must walk the full vector
+        // in the requested order.
+        int dim = randomIntBetween(1, PrefixLayout.MIN_DIMENSION - 1);
+        assertFalse("test precondition: dimension must disable the split", PrefixLayout.isEnabled(dim));
+
+        int numCentroids = 4;
+        float[][] centroids = randomCentroids(numCentroids, dim);
+        float[] global = randomFloatVector(dim);
+        OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(VectorSimilarityFunction.EUCLIDEAN);
+        CentroidSupplier supplier = CentroidSupplier.fromArray(centroids, KMeansResult.emptyFloat(), dim);
+        PrefixQuantizedCentroids split = new PrefixQuantizedCentroids(supplier, dim, quantizer, global);
+        assertNull("small dimensions must not produce a suffix view", split.suffixView());
+
+        // Iterate centroids in reverse order via a custom ordTransformer.
+        int subsetSize = 3;
+        IntToIntFunction reverse = i -> subsetSize - 1 - i;
+        split.reset(reverse, subsetSize);
+        QuantizedVectorValues prefixView = split.prefixView();
+        assertEquals(subsetSize, prefixView.count());
+
+        for (int i = 0; i < subsetSize; i++) {
+            int sourceOrd = subsetSize - 1 - i;
+            byte[] viewBytes = prefixView.next().clone();
+            assertEquals(dim, viewBytes.length);
+
+            int[] expectedInts = new int[dim];
+            quantizer.scalarQuantize(centroids[sourceOrd], new float[dim], expectedInts, (byte) 7, global);
+            byte[] expectedBytes = new byte[dim];
+            for (int j = 0; j < dim; j++) {
+                expectedBytes[j] = (byte) expectedInts[j];
+            }
+            assertArrayEquals("iteration " + i + " (centroid " + sourceOrd + ") bytes mismatch", expectedBytes, viewBytes);
+        }
+    }
+
     private float[][] randomCentroids(int n, int dim) {
         float[][] out = new float[n][];
         for (int i = 0; i < n; i++) {
@@ -172,6 +242,3 @@ public class PrefixQuantizedCentroidsTests extends ESTestCase {
         return v;
     }
 }
-
-
-
