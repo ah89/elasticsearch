@@ -28,6 +28,15 @@ import org.apache.lucene.util.VectorUtil;
  * inverted, summed in the raw domain, and re-applied. Errors come exclusively from each half
  * carrying its own OSQ interval / quantised-sum corrections (and being lossy in different ways);
  * they vanish as quantisation becomes lossless.
+ *
+ * <p><b>Clamping caveat.</b> {@code applyCorrections} floors DOT_PRODUCT and COSINE scores at 0
+ * (via {@code Math.max((1 + score) / 2f, 0)}) and EUCLIDEAN scores at 0 (via
+ * {@code Math.max(1 / (1 + score), 0)}). The inversion performed here cannot recover information
+ * lost to that floor. In practice this matters only for "far" centroids whose halves saturate;
+ * such candidates would not survive top-K refinement anyway, so combine() may return an
+ * approximate result for them but will never be relied on for ranking among close candidates.
+ * Tests that validate the algebra against full-dim OSQ scores must use unit-normalised vectors
+ * (for DOT_PRODUCT / COSINE) so that no half clamps.
  */
 public final class PrefixSuffixScoreCombiner {
 
@@ -50,17 +59,16 @@ public final class PrefixSuffixScoreCombiner {
 
     private static float combineEuclidean(float prefixScore, float suffixScore) {
         // Each half is 1 / (1 + d^2_half); combined squared distance is the sum of halves'
-        // squared distances. If either half saturated to 0 (infinite distance), the combined
-        // score is also 0.
-        if (prefixScore <= 0f || suffixScore <= 0f) {
+        // squared distances. If either half saturated to 0 (infinite distance), or either input
+        // is non-finite (NaN / Infinity), the combined score is also 0 - a bad refinement must
+        // never out-rank a legitimate candidate.
+        if (Float.isFinite(prefixScore) == false || Float.isFinite(suffixScore) == false || prefixScore <= 0f || suffixScore <= 0f) {
             return 0f;
         }
         float denom = (1f / prefixScore) + (1f / suffixScore) - 1f;
         // For valid inputs in (0, 1] both reciprocals are >= 1, so denom is always >= 1.
         // A non-finite or non-positive denom therefore signals invalid/degenerate input
-        // (e.g. a NaN score, or a per-half score that drifted above 1 from numerical noise).
-        // Fall back to the worst-possible score (0) rather than the best (1) so a bad refinement
-        // can never promote a candidate above legitimate ones.
+        // (e.g. a per-half score that drifted above 1 from numerical noise). Same fallback.
         if (Float.isFinite(denom) == false || denom <= 0f) {
             return 0f;
         }
