@@ -50,6 +50,18 @@ public abstract sealed class DiskBBQBulkWriter {
     }
 
     /**
+     * Static accessor for the LargeBit/7-bit per-vector byte cost. Exposed so readers (which
+     * never instantiate a writer) can compute on-disk region sizes from the same formula the
+     * writer uses, keeping writer and reader locked to a single source of truth.
+     */
+    public static int largeBitBytesPerVector(int dimension) {
+        // 7-bit LargeBit layout: one byte per dimension followed by a fixed correction footer
+        // of three floats (lowerInterval, upperInterval, additionalCorrection) and one int
+        // (quantizedComponentSum).
+        return dimension + 3 * Float.BYTES + Integer.BYTES;
+    }
+
+    /**
      * Factory method to create a DiskBBQBulkWriter based on the bit size.
      * @param bitSize the bit size of the quantized vectors
      * @param bulkSize the number of vectors to write in bulk
@@ -169,10 +181,8 @@ public abstract sealed class DiskBBQBulkWriter {
 
         @Override
         public int bytesPerVector(int dimension) {
-            // 7-bit LargeBit layout: one byte per dimension followed by a fixed correction footer
-            // of three floats (lowerInterval, upperInterval, additionalCorrection) and one int
-            // (quantizedComponentSum). Inherited by LargeBitEncodedDiskBBQBulkWriter.
-            return dimension + 3 * Float.BYTES + Integer.BYTES;
+            // Delegated to the static accessor so writer and reader share a single formula.
+            return largeBitBytesPerVector(dimension);
         }
 
         @Override

@@ -30,11 +30,13 @@ import org.elasticsearch.index.codec.vectors.OptimizedScalarQuantizer;
 import org.elasticsearch.index.codec.vectors.cluster.KMeansFloatVectorValues;
 import org.elasticsearch.index.codec.vectors.cluster.NeighborQueue;
 import org.elasticsearch.index.codec.vectors.diskbbq.CentroidIterator;
+import org.elasticsearch.index.codec.vectors.diskbbq.DiskBBQBulkWriter;
 import org.elasticsearch.index.codec.vectors.diskbbq.DocIdsWriter;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.PostingMetadata;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
+import org.elasticsearch.index.codec.vectors.diskbbq.PrefixLayout;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
 import org.elasticsearch.search.vectors.BulkKnnCollector;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
@@ -132,20 +134,34 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final FixedBitSet acceptParents = getParentCentroidFilter(centroids, numParents, numCentroids, acceptDocs, fieldEntry.numSlices);
         // build centroid search helpers
         final int bulkSize = fieldEntry.getBulkSize();
+        final int dimension = fieldInfo.getVectorDimension();
         final OptimizedScalarQuantizer scalarQuantizer = new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction());
-        final int[] scratch = new int[targetQuery.length];
-        final OptimizedScalarQuantizer.QuantizationResult queryParams = scalarQuantizer.scalarQuantize(
-            targetQuery,
-            new float[targetQuery.length],
-            scratch,
-            (byte) 7,
-            fieldEntry.globalCentroid()
-        );
-        final byte[] quantized = new byte[targetQuery.length];
-        for (int i = 0; i < quantized.length; i++) {
-            quantized[i] = (byte) scratch[i];
-        }
-        final ES92Int7VectorsScorer scorer = ESVectorUtil.getES92Int7VectorsScorer(centroids, fieldInfo.getVectorDimension(), bulkSize);
+        final boolean splitLayout = useSplitLayout(dimension, versionMeta);
+        final boolean needsFullContext = (splitLayout == false) || numParents > 0;
+        final ScoringContext fullContext = needsFullContext
+            ? buildScoringContext(
+                centroids,
+                scalarQuantizer,
+                targetQuery,
+                fieldEntry.globalCentroid(),
+                0,
+                dimension,
+                bulkSize,
+                /* suffixDim */ 0
+            )
+            : null;
+        final ScoringContext childrenContext = splitLayout
+            ? buildScoringContext(
+                centroids,
+                scalarQuantizer,
+                targetQuery,
+                fieldEntry.globalCentroid(),
+                0,
+                PrefixLayout.prefixLength(dimension),
+                bulkSize,
+                PrefixLayout.suffixLength(dimension)
+            )
+            : fullContext;
         // build iterator
         CentroidIterator centroidIterator;
         if (numParents > 0) {
@@ -156,9 +172,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 centroids,
                 numParents,
                 numCentroids,
-                scorer,
-                quantized,
-                queryParams,
+                fullContext,
+                childrenContext,
                 fieldEntry.globalCentroidDp(),
                 visitRatio * centroidOversampling,
                 acceptParents,
@@ -173,15 +188,86 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 fieldInfo,
                 centroids,
                 numCentroids,
-                scorer,
-                quantized,
-                queryParams,
+                childrenContext,
                 fieldEntry.globalCentroidDp(),
                 acceptCentroids != null ? acceptCentroids : acceptParents,
                 bulkSize
             );
         }
         return getPostingListPrefetchIterator(centroidIterator, postingListSlice);
+    }
+
+    /**
+     * True when the on-disk centroid layout is the v2 prefix/suffix split. We require both the
+     * stream version to be {@code >= VERSION_PREFIX_SPLIT_CENTROIDS} <em>and</em> the dimension
+     * to trigger {@link PrefixLayout#isEnabled(int)}; the writer only emits the split when both
+     * are true (see {@code ESNextDiskBBQVectorsWriter.writeCentroidsWithoutParents}).
+     */
+    private static boolean useSplitLayout(int dimension, int version) {
+        return version >= ESNextDiskBBQVectorsFormat.VERSION_PREFIX_SPLIT_CENTROIDS && PrefixLayout.isEnabled(dimension);
+    }
+
+    /**
+     * Bundle of the per-region state needed to score a centroid (or a slice of one). The
+     * {@code scorer} is wired to a specific dimension at construction so split readers carry two
+     * separate contexts. {@code suffixBytesPerVector} is non-zero only for the children region of
+     * a v2 split layout and tells {@link #score} (or its caller) how many bytes to skip past the
+     * suffix region to land at whatever comes next on disk.
+     */
+    private record ScoringContext(
+        ES92Int7VectorsScorer scorer,
+        byte[] quantizedQuery,
+        OptimizedScalarQuantizer.QuantizationResult queryParams,
+        long prefixBytesPerVector,
+        long suffixBytesPerVector
+    ) {}
+
+    private static ScoringContext buildScoringContext(
+        IndexInput centroids,
+        OptimizedScalarQuantizer scalarQuantizer,
+        float[] targetQuery,
+        float[] globalCentroid,
+        int from,
+        int scorerDim,
+        int bulkSize,
+        int suffixDim
+    ) throws IOException {
+        // OptimizedScalarQuantizer requires every array (vector, residual, destination) to be the
+        // same length, so we cannot share buffers across contexts of different dim. The only
+        // allocation we can skip cheaply is the slice copy when the request already covers the
+        // whole array — taken below for the full-dim context, leaving the split-context path with
+        // two unavoidable float[scorerDim] slice copies plus the required per-context scratch/
+        // residual/quantized arrays. Adding an offset/length variant to scalarQuantize would
+        // remove those copies but is intentionally out of scope for this commit.
+        final float[] queryView = (from == 0 && scorerDim == targetQuery.length) ? targetQuery : sliceCopy(targetQuery, from, scorerDim);
+        final float[] centroidView = (from == 0 && scorerDim == globalCentroid.length)
+            ? globalCentroid
+            : sliceCopy(globalCentroid, from, scorerDim);
+        final int[] scratch = new int[scorerDim];
+        final OptimizedScalarQuantizer.QuantizationResult queryParams = scalarQuantizer.scalarQuantize(
+            queryView,
+            new float[scorerDim],
+            scratch,
+            (byte) 7,
+            centroidView
+        );
+        final byte[] quantized = new byte[scorerDim];
+        for (int i = 0; i < scorerDim; i++) {
+            quantized[i] = (byte) scratch[i];
+        }
+        return new ScoringContext(
+            ESVectorUtil.getES92Int7VectorsScorer(centroids, scorerDim, bulkSize),
+            quantized,
+            queryParams,
+            DiskBBQBulkWriter.largeBitBytesPerVector(scorerDim),
+            suffixDim == 0 ? 0L : DiskBBQBulkWriter.largeBitBytesPerVector(suffixDim)
+        );
+    }
+
+    private static float[] sliceCopy(float[] src, int from, int length) {
+        float[] out = new float[length];
+        System.arraycopy(src, from, out, 0, length);
+        return out;
     }
 
     private FixedBitSet getCentroidFilter(
@@ -463,30 +549,27 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         FieldInfo fieldInfo,
         IndexInput centroids,
         int numCentroids,
-        ES92Int7VectorsScorer scorer,
-        byte[] quantizeQuery,
-        OptimizedScalarQuantizer.QuantizationResult queryParams,
+        ScoringContext ctx,
         float globalCentroidDp,
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
         final NeighborQueue neighborQueue = new NeighborQueue(numCentroids, true);
-        final long centroidQuantizeSize = fieldInfo.getVectorDimension() + 3 * Float.BYTES + Integer.BYTES;
         score(
             neighborQueue,
             numCentroids,
             0,
-            scorer,
             centroids,
-            centroidQuantizeSize,
-            quantizeQuery,
-            queryParams,
+            ctx,
             globalCentroidDp,
             fieldInfo.getVectorSimilarityFunction(),
             new float[bulkSize],
             acceptCentroids,
             bulkSize
         );
+        if (ctx.suffixBytesPerVector() > 0) {
+            centroids.skipBytes((long) numCentroids * ctx.suffixBytesPerVector());
+        }
         long offset = centroids.getFilePointer();
         return new CentroidIterator() {
             @Override
@@ -513,9 +596,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         IndexInput centroids,
         int numParents,
         int numCentroids,
-        ES92Int7VectorsScorer scorer,
-        byte[] quantizeQuery,
-        OptimizedScalarQuantizer.QuantizationResult queryParams,
+        ScoringContext parentsCtx,
+        ScoringContext childrenCtx,
         float globalCentroidDp,
         float centroidRatio,
         FixedBitSet acceptParents,
@@ -524,7 +606,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     ) throws IOException {
         // build the three queues we are going to use
         final long rawParentSize = (long) fieldInfo.getVectorDimension() * Float.BYTES;
-        final long centroidQuantizeSize = fieldInfo.getVectorDimension() + 3 * Float.BYTES + Integer.BYTES;
+        final long childrenTotalBytesPerVector = childrenCtx.prefixBytesPerVector() + childrenCtx.suffixBytesPerVector();
         final NeighborQueue parentsQueue = new NeighborQueue(numParents, true);
         final int maxChildrenSize = centroids.readVInt();
         final NeighborQueue currentParentQueue = new NeighborQueue(maxChildrenSize, true);
@@ -555,20 +637,19 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     parentsQueue.add(i, 0.5f);
                 }
             }
-            centroids.skipBytes((centroidQuantizeSize + rawParentSize) * numParents);
+            // Skip past raw parents + quantized parents. Parents are NOT split, so this uses the
+            // parents' full-dim byte cost from parentsCtx.
+            centroids.skipBytes((parentsCtx.prefixBytesPerVector() + rawParentSize) * numParents);
         } else {
             neighborQueue = new NeighborQueue(bufferSize, true);
-            // score the parents
+            // score the parents (always full-dim, never split)
             centroids.skipBytes(rawParentSize * numParents);
             score(
                 parentsQueue,
                 numParents,
                 0,
-                scorer,
                 centroids,
-                centroidQuantizeSize,
-                quantizeQuery,
-                queryParams,
+                parentsCtx,
                 globalCentroidDp,
                 fieldInfo.getVectorSimilarityFunction(),
                 scores,
@@ -587,11 +668,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 centroids,
                 offset + 2L * Integer.BYTES * pop,
                 childrenOffset,
-                centroidQuantizeSize,
+                childrenCtx,
                 fieldInfo,
-                scorer,
-                quantizeQuery,
-                queryParams,
                 globalCentroidDp,
                 scores,
                 acceptCentroids,
@@ -603,7 +681,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 neighborQueue.add(children, score);
             }
         }
-        final long childrenFileOffsets = childrenOffset + centroidQuantizeSize * numCentroids;
+        // The posting offsets table follows the entire children section (prefix region + suffix
+        // region for split layouts). childrenTotalBytesPerVector covers both regions per child.
+        final long childrenFileOffsets = childrenOffset + childrenTotalBytesPerVector * numCentroids;
         return new CentroidIterator() {
 
             @Override
@@ -635,11 +715,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                         centroids,
                         offset + 2L * Integer.BYTES * pop,
                         childrenOffset,
-                        centroidQuantizeSize,
+                        childrenCtx,
                         fieldInfo,
-                        scorer,
-                        quantizeQuery,
-                        queryParams,
                         globalCentroidDp,
                         scores,
                         acceptCentroids,
@@ -658,11 +735,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         IndexInput centroids,
         long parentOffset,
         long childrenOffset,
-        long centroidQuantizeSize,
+        ScoringContext childrenCtx,
         FieldInfo fieldInfo,
-        ES92Int7VectorsScorer scorer,
-        byte[] quantizeQuery,
-        OptimizedScalarQuantizer.QuantizationResult queryParams,
         float globalCentroidDp,
         float[] scores,
         FixedBitSet acceptCentroids,
@@ -671,16 +745,18 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         centroids.seek(parentOffset);
         int childrenOrdinal = centroids.readInt();
         int numChildren = centroids.readInt();
-        centroids.seek(childrenOffset + centroidQuantizeSize * childrenOrdinal);
+        // The writer lays out ALL children's prefix bytes contiguously across parent groups
+        // (see ESNextDiskBBQVectorsWriter.writeCentroidsWithParents), so we seek into the global
+        // prefix region using only the prefix-byte stride. Suffix bytes for these children live
+        // in a separate global suffix region that is left untouched here and will be visited by
+        // the future top-K refinement pass (commit H).
+        centroids.seek(childrenOffset + childrenCtx.prefixBytesPerVector() * childrenOrdinal);
         score(
             neighborQueue,
             numChildren,
             childrenOrdinal,
-            scorer,
             centroids,
-            centroidQuantizeSize,
-            quantizeQuery,
-            queryParams,
+            childrenCtx,
             globalCentroidDp,
             fieldInfo.getVectorSimilarityFunction(),
             scores,
@@ -693,32 +769,39 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         NeighborQueue neighborQueue,
         int size,
         int scoresOffset,
-        ES92Int7VectorsScorer scorer,
         IndexInput centroids,
-        long centroidQuantizeSize,
-        byte[] quantizeQuery,
-        OptimizedScalarQuantizer.QuantizationResult queryCorrections,
+        ScoringContext ctx,
         float centroidDp,
         VectorSimilarityFunction similarityFunction,
         float[] scores,
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
+        // Score the prefix region only; the scorer's wrapped IndexInput is the same `centroids`
+        // we manipulate above, so it advances by exactly ctx.prefixBytesPerVector() per vector.
+        // The caller decides what (if anything) to do about the matching suffix region:
+        // * no-parents path: skip the trailing suffix region once after this call.
+        // * with-parents children path: do nothing — suffix region is global, addressed by
+        // random-access seek when commit H lands.
+        final long prefixBytesPerVector = ctx.prefixBytesPerVector();
+        final byte[] quantizeQuery = ctx.quantizedQuery();
+        final OptimizedScalarQuantizer.QuantizationResult queryCorrections = ctx.queryParams();
         int limit = size - bulkSize + 1;
         int i = 0;
         for (; i < limit; i += bulkSize) {
             if (acceptCentroids == null || acceptCentroids.cardinality(scoresOffset + i, scoresOffset + i + bulkSize) > 0) {
-                scorer.scoreBulk(
-                    quantizeQuery,
-                    queryCorrections.lowerInterval(),
-                    queryCorrections.upperInterval(),
-                    queryCorrections.quantizedComponentSum(),
-                    queryCorrections.additionalCorrection(),
-                    similarityFunction,
-                    centroidDp,
-                    scores,
-                    bulkSize
-                );
+                ctx.scorer()
+                    .scoreBulk(
+                        quantizeQuery,
+                        queryCorrections.lowerInterval(),
+                        queryCorrections.upperInterval(),
+                        queryCorrections.quantizedComponentSum(),
+                        queryCorrections.additionalCorrection(),
+                        similarityFunction,
+                        centroidDp,
+                        scores,
+                        bulkSize
+                    );
                 for (int j = 0; j < bulkSize; j++) {
                     int centroidOrd = scoresOffset + i + j;
                     if (acceptCentroids == null || acceptCentroids.get(centroidOrd)) {
@@ -726,24 +809,25 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     }
                 }
             } else {
-                centroids.skipBytes(bulkSize * centroidQuantizeSize);
+                centroids.skipBytes(bulkSize * prefixBytesPerVector);
             }
         }
 
         int tailBulkSize = size - i;
         if (tailBulkSize > 0) {
             if (acceptCentroids == null || acceptCentroids.cardinality(scoresOffset + i, scoresOffset + i + tailBulkSize) > 0) {
-                scorer.scoreBulk(
-                    quantizeQuery,
-                    queryCorrections.lowerInterval(),
-                    queryCorrections.upperInterval(),
-                    queryCorrections.quantizedComponentSum(),
-                    queryCorrections.additionalCorrection(),
-                    similarityFunction,
-                    centroidDp,
-                    scores,
-                    tailBulkSize
-                );
+                ctx.scorer()
+                    .scoreBulk(
+                        quantizeQuery,
+                        queryCorrections.lowerInterval(),
+                        queryCorrections.upperInterval(),
+                        queryCorrections.quantizedComponentSum(),
+                        queryCorrections.additionalCorrection(),
+                        similarityFunction,
+                        centroidDp,
+                        scores,
+                        tailBulkSize
+                    );
                 for (int j = 0; j < tailBulkSize; j++) {
                     int centroidOrd = scoresOffset + i + j;
                     if (acceptCentroids == null || acceptCentroids.get(centroidOrd)) {
@@ -751,7 +835,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     }
                 }
             } else {
-                centroids.skipBytes(tailBulkSize * centroidQuantizeSize);
+                centroids.skipBytes(tailBulkSize * prefixBytesPerVector);
             }
         }
     }
