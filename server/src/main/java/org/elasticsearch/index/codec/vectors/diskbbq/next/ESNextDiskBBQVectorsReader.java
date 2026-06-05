@@ -638,8 +638,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
-        // children suffix region is global (not grouped by parent); top-K refinement will address
-        // it by random-access seek into childrenOffset + numCentroids * prefixBytes.
+        // children suffix bytes form a global region (not grouped by parent) located at
+        // childrenOffset + numCentroids * childrenCtx.bytesPerVector(); top-K refinement seeks
+        // into it after the initial fill below.
         assert suffixContext == null || childrenCtx.trailingBytesPerVector() == suffixContext.bytesPerVector();
         // build the three queues we are going to use
         final long rawParentSize = (long) fieldInfo.getVectorDimension() * Float.BYTES;
@@ -717,6 +718,20 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 final int children = currentParentQueue.pop();
                 neighborQueue.add(children, score);
             }
+        }
+        // Refine the initial fill using the global suffix region. Children populated on-demand
+        // later by the iterator's nextCentroid keep their prefix-only scores; they come from
+        // successively-worse parents, so the marginal recall benefit of refining them is small.
+        if (suffixContext != null && neighborQueue.size() > 0) {
+            final long childrenSuffixRegionStart = childrenOffset + childrenCtx.bytesPerVector() * numCentroids;
+            refineTopKWithSuffix(
+                neighborQueue,
+                centroids,
+                childrenSuffixRegionStart,
+                suffixContext,
+                fieldInfo.getVectorSimilarityFunction(),
+                globalCentroidDp
+            );
         }
         // The posting offsets table follows the entire children section (prefix region + suffix
         // region for split layouts). childrenTotalBytesPerVector covers both regions per child.
