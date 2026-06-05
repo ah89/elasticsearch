@@ -37,6 +37,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.PostingMetadata;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefixLayout;
+import org.elasticsearch.index.codec.vectors.diskbbq.PrefixSuffixScoreCombiner;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
 import org.elasticsearch.search.vectors.BulkKnnCollector;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
@@ -147,7 +148,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 0,
                 dimension,
                 bulkSize,
-                /* suffixDim */ 0
+                /* trailingDim */ 0
             )
             : null;
         final ScoringContext childrenContext = splitLayout
@@ -163,7 +164,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             )
             : fullContext;
         // Suffix-only scorer for top-K refinement: same OSQ quantization as the children scorer
-        // but over the suffix slice of the global centroid. Not consumed yet.
+        // but over the suffix slice of the global centroid.
         final ScoringContext suffixContext = splitLayout
             ? buildScoringContext(
                 centroids,
@@ -173,7 +174,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 PrefixLayout.prefixLength(dimension),
                 PrefixLayout.suffixLength(dimension),
                 bulkSize,
-                /* suffixDim */ 0
+                /* trailingDim */ 0
             )
             : null;
         // build iterator
@@ -226,16 +227,19 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     /**
      * Bundle of the per-region state needed to score a centroid (or a slice of one). The
      * {@code scorer} is wired to a specific dimension at construction so split readers carry two
-     * separate contexts. {@code suffixBytesPerVector} is non-zero only for the children region of
-     * a v2 split layout and tells {@link #score} (or its caller) how many bytes to skip past the
-     * suffix region to land at whatever comes next on disk.
+     * separate contexts. {@code bytesPerVector} is the per-vector byte cost of the data this
+     * scorer reads (full dim for the unsplit / parents / full context, prefix dim for the
+     * children context, suffix dim for the suffix context). {@code trailingBytesPerVector} is
+     * the per-vector cost of any sibling region that physically trails this scorer's data on
+     * disk; non-zero only for the children context of a v2 split layout, whose data is followed
+     * by the global suffix region.
      */
     private record ScoringContext(
         ES92Int7VectorsScorer scorer,
         byte[] quantizedQuery,
         OptimizedScalarQuantizer.QuantizationResult queryParams,
-        long prefixBytesPerVector,
-        long suffixBytesPerVector
+        long bytesPerVector,
+        long trailingBytesPerVector
     ) {}
 
     private static ScoringContext buildScoringContext(
@@ -246,7 +250,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         int from,
         int scorerDim,
         int bulkSize,
-        int suffixDim
+        int trailingDim
     ) throws IOException {
         // OptimizedScalarQuantizer requires every array (vector, residual, destination) to be the
         // same length, so we cannot share buffers across contexts of different dim. The only
@@ -276,7 +280,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             quantized,
             queryParams,
             DiskBBQBulkWriter.largeBitBytesPerVector(scorerDim),
-            suffixDim == 0 ? 0L : DiskBBQBulkWriter.largeBitBytesPerVector(suffixDim)
+            trailingDim == 0 ? 0L : DiskBBQBulkWriter.largeBitBytesPerVector(trailingDim)
         );
     }
 
@@ -571,7 +575,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
-        assert suffixContext == null || ctx.suffixBytesPerVector() == suffixContext.prefixBytesPerVector();
+        assert suffixContext == null || ctx.trailingBytesPerVector() == suffixContext.bytesPerVector();
         final NeighborQueue neighborQueue = new NeighborQueue(numCentroids, true);
         score(
             neighborQueue,
@@ -585,10 +589,21 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             acceptCentroids,
             bulkSize
         );
-        if (ctx.suffixBytesPerVector() > 0) {
-            centroids.skipBytes((long) numCentroids * ctx.suffixBytesPerVector());
+        final long suffixRegionStart = centroids.getFilePointer();
+        if (suffixContext != null && neighborQueue.size() > 0) {
+            refineTopKWithSuffix(
+                neighborQueue,
+                centroids,
+                suffixRegionStart,
+                suffixContext,
+                fieldInfo.getVectorSimilarityFunction(),
+                globalCentroidDp
+            );
         }
-        long offset = centroids.getFilePointer();
+        // Land at the posting-offsets table. When the segment has a suffix region this skips past
+        // it; when it doesn't, ctx.trailingBytesPerVector() == 0 and the seek is a no-op.
+        final long offset = suffixRegionStart + (long) numCentroids * ctx.trailingBytesPerVector();
+        centroids.seek(offset);
         return new CentroidIterator() {
             @Override
             public boolean hasNext() {
@@ -625,10 +640,10 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     ) throws IOException {
         // children suffix region is global (not grouped by parent); top-K refinement will address
         // it by random-access seek into childrenOffset + numCentroids * prefixBytes.
-        assert suffixContext == null || childrenCtx.suffixBytesPerVector() == suffixContext.prefixBytesPerVector();
+        assert suffixContext == null || childrenCtx.trailingBytesPerVector() == suffixContext.bytesPerVector();
         // build the three queues we are going to use
         final long rawParentSize = (long) fieldInfo.getVectorDimension() * Float.BYTES;
-        final long childrenTotalBytesPerVector = childrenCtx.prefixBytesPerVector() + childrenCtx.suffixBytesPerVector();
+        final long childrenTotalBytesPerVector = childrenCtx.bytesPerVector() + childrenCtx.trailingBytesPerVector();
         final NeighborQueue parentsQueue = new NeighborQueue(numParents, true);
         final int maxChildrenSize = centroids.readVInt();
         final NeighborQueue currentParentQueue = new NeighborQueue(maxChildrenSize, true);
@@ -661,7 +676,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             }
             // Skip past raw parents + quantized parents. Parents are NOT split, so this uses the
             // parents' full-dim byte cost from parentsCtx.
-            centroids.skipBytes((parentsCtx.prefixBytesPerVector() + rawParentSize) * numParents);
+            centroids.skipBytes((parentsCtx.bytesPerVector() + rawParentSize) * numParents);
         } else {
             neighborQueue = new NeighborQueue(bufferSize, true);
             // score the parents (always full-dim, never split)
@@ -771,7 +786,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // (see ESNextDiskBBQVectorsWriter.writeCentroidsWithParents), so we seek into the global
         // prefix region using only the prefix-byte stride. Suffix bytes for these children live
         // in a separate global suffix region addressed by random-access seek elsewhere.
-        centroids.seek(childrenOffset + childrenCtx.prefixBytesPerVector() * childrenOrdinal);
+        centroids.seek(childrenOffset + childrenCtx.bytesPerVector() * childrenOrdinal);
         score(
             neighborQueue,
             numChildren,
@@ -798,13 +813,14 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
-        // Score the prefix region only; the scorer's wrapped IndexInput is the same `centroids`
-        // we manipulate above, so it advances by exactly ctx.prefixBytesPerVector() per vector.
-        // The caller decides what (if anything) to do about the matching suffix region:
+        // Score `size` consecutive vectors at the current `centroids` position. The scorer's
+        // wrapped IndexInput is the same `centroids` we manipulate above, so it advances by
+        // exactly ctx.bytesPerVector() per vector. For split layouts the caller handles any
+        // trailing suffix region:
         // * no-parents path: skip the trailing suffix region once after this call.
-        // * with-parents children path: do nothing — suffix region is global and is addressed by
-        // random-access seek elsewhere.
-        final long prefixBytesPerVector = ctx.prefixBytesPerVector();
+        // * with-parents children path: do nothing — suffix region is global and is addressed
+        // by random-access seek elsewhere.
+        final long bytesPerVector = ctx.bytesPerVector();
         final byte[] quantizeQuery = ctx.quantizedQuery();
         final OptimizedScalarQuantizer.QuantizationResult queryCorrections = ctx.queryParams();
         int limit = size - bulkSize + 1;
@@ -830,7 +846,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     }
                 }
             } else {
-                centroids.skipBytes(bulkSize * prefixBytesPerVector);
+                centroids.skipBytes(bulkSize * bytesPerVector);
             }
         }
 
@@ -856,8 +872,63 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     }
                 }
             } else {
-                centroids.skipBytes(tailBulkSize * prefixBytesPerVector);
+                centroids.skipBytes(tailBulkSize * bytesPerVector);
             }
+        }
+    }
+
+    /**
+     * Refine count tuning. We refine top {@code max(REFINE_MIN, queueSize / REFINE_FRACTION)}
+     * centroids after the prefix pass: refining more improves recall, refining fewer cuts cost.
+     * Picked as a heuristic and worth re-tuning with benchmarks.
+     */
+    private static final int REFINE_MIN = 64;
+
+    private static final int REFINE_FRACTION = 10;
+
+    /**
+     * Drains the top of {@code neighborQueue} (already populated by prefix-only scoring), reads
+     * the matching suffix bytes via {@code suffixContext}, combines prefix + suffix via
+     * {@link PrefixSuffixScoreCombiner}, and pushes the refined entries back into the queue.
+     * Remaining (un-refined) entries keep their prefix-only score; the heap order naturally
+     * reflects whichever score is higher.
+     */
+    private static void refineTopKWithSuffix(
+        NeighborQueue neighborQueue,
+        IndexInput centroids,
+        long suffixRegionStart,
+        ScoringContext suffixContext,
+        VectorSimilarityFunction similarityFunction,
+        float centroidDp
+    ) throws IOException {
+        final int refineCount = Math.min(neighborQueue.size(), Math.max(REFINE_MIN, neighborQueue.size() / REFINE_FRACTION));
+        // suffixContext.bytesPerVector() is the per-vector cost of the suffix scorer's data,
+        // which IS the suffix stride on disk.
+        final long suffixBytesPerVector = suffixContext.bytesPerVector();
+        final OptimizedScalarQuantizer.QuantizationResult queryParams = suffixContext.queryParams();
+        final byte[] quantizedQuery = suffixContext.quantizedQuery();
+        final int[] refinedIds = new int[refineCount];
+        final float[] refinedScores = new float[refineCount];
+        for (int i = 0; i < refineCount; i++) {
+            final long raw = neighborQueue.popRaw();
+            final int centroidOrd = neighborQueue.decodeNodeId(raw);
+            final float prefixScore = neighborQueue.decodeScore(raw);
+            centroids.seek(suffixRegionStart + (long) centroidOrd * suffixBytesPerVector);
+            final float suffixScore = suffixContext.scorer()
+                .score(
+                    quantizedQuery,
+                    queryParams.lowerInterval(),
+                    queryParams.upperInterval(),
+                    queryParams.quantizedComponentSum(),
+                    queryParams.additionalCorrection(),
+                    similarityFunction,
+                    centroidDp
+                );
+            refinedIds[i] = centroidOrd;
+            refinedScores[i] = PrefixSuffixScoreCombiner.combine(similarityFunction, prefixScore, suffixScore);
+        }
+        for (int i = 0; i < refineCount; i++) {
+            neighborQueue.add(refinedIds[i], refinedScores[i]);
         }
     }
 
