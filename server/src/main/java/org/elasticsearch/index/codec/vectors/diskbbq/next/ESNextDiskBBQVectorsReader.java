@@ -595,7 +595,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 neighborQueue,
                 centroids,
                 suffixRegionStart,
+                numCentroids,
                 suffixContext,
+                bulkSize,
                 fieldInfo.getVectorSimilarityFunction(),
                 globalCentroidDp
             );
@@ -728,7 +730,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 neighborQueue,
                 centroids,
                 childrenSuffixRegionStart,
+                numCentroids,
                 suffixContext,
+                bulkSize,
                 fieldInfo.getVectorSimilarityFunction(),
                 globalCentroidDp
             );
@@ -903,48 +907,120 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
 
     /**
      * Drains the top of {@code neighborQueue} (already populated by prefix-only scoring), reads
-     * the matching suffix bytes via {@code suffixContext}, combines prefix + suffix via
-     * {@link PrefixSuffixScoreCombiner}, and pushes the refined entries back into the queue.
-     * Remaining (un-refined) entries keep their prefix-only score; the heap order naturally
-     * reflects whichever score is higher.
+     * matching suffix bytes via {@code suffixContext} for any block that contains a top-K
+     * centroid, combines prefix + suffix via {@link PrefixSuffixScoreCombiner}, and pushes the
+     * refined entries back into the queue. Remaining (un-refined) entries keep their prefix-only
+     * score; the heap order naturally reflects whichever score is higher.
+     *
+     * <p><b>Layout-driven access pattern:</b> the suffix region is written by
+     * {@code LargeBitEncodedDiskBBQBulkWriter} in block-interleaved layout
+     * ({@code [bulkSize * dim bytes][bulkSize * 3 floats][bulkSize * 1 int]} per block). Random
+     * access via {@link ES92Int7VectorsScorer#score} would land on raw bytes but read garbage
+     * correction values from the neighbouring vector. The only safe reader is
+     * {@link ES92Int7VectorsScorer#scoreBulk}, which consumes one full block at a time. So we
+     * walk the suffix region sequentially: for blocks that contain a top-K centroid we bulk-
+     * score, for blocks that do not we {@code skipBytes} past them.
+     *
+     * <p><b>Worst case:</b> if every top-K centroid lands in a different block we bulk-score
+     * {@code refineCount * bulkSize} suffix vectors instead of {@code refineCount}; in
+     * common IVF sizings ({@code numCentroids >> refineCount * bulkSize}) this is still well
+     * under reading the entire suffix region.
      */
     private static void refineTopKWithSuffix(
         NeighborQueue neighborQueue,
         IndexInput centroids,
         long suffixRegionStart,
+        int numCentroids,
         ScoringContext suffixContext,
+        int bulkSize,
         VectorSimilarityFunction similarityFunction,
         float centroidDp
     ) throws IOException {
         final int refineCount = Math.min(neighborQueue.size(), Math.max(REFINE_MIN, neighborQueue.size() / REFINE_FRACTION));
-        // suffixContext.bytesPerVector() is the per-vector cost of the suffix scorer's data,
-        // which IS the suffix stride on disk.
-        final long suffixBytesPerVector = suffixContext.bytesPerVector();
-        final OptimizedScalarQuantizer.QuantizationResult queryParams = suffixContext.queryParams();
-        final byte[] quantizedQuery = suffixContext.quantizedQuery();
+        if (refineCount == 0) {
+            return;
+        }
         final int[] refinedIds = new int[refineCount];
-        final float[] refinedScores = new float[refineCount];
+        final float[] refinedPrefixScores = new float[refineCount];
+        // Drain the prefix-only top-K and remember which centroid ordinals need refinement.
+        // needsScore lets us decide per-block "any of mine here?" with one array lookup per
+        // vector inside the sequential pass below.
+        final boolean[] needsScore = new boolean[numCentroids];
         for (int i = 0; i < refineCount; i++) {
             final long raw = neighborQueue.popRaw();
             final int centroidOrd = neighborQueue.decodeNodeId(raw);
-            final float prefixScore = neighborQueue.decodeScore(raw);
-            centroids.seek(suffixRegionStart + (long) centroidOrd * suffixBytesPerVector);
-            final float suffixScore = suffixContext.scorer()
-                .score(
-                    quantizedQuery,
-                    queryParams.lowerInterval(),
-                    queryParams.upperInterval(),
-                    queryParams.quantizedComponentSum(),
-                    queryParams.additionalCorrection(),
-                    similarityFunction,
-                    centroidDp
-                );
             refinedIds[i] = centroidOrd;
-            refinedScores[i] = PrefixSuffixScoreCombiner.combine(similarityFunction, prefixScore, suffixScore);
+            refinedPrefixScores[i] = neighborQueue.decodeScore(raw);
+            needsScore[centroidOrd] = true;
         }
-        for (int i = 0; i < refineCount; i++) {
-            neighborQueue.add(refinedIds[i], refinedScores[i]);
+        // Score per-block, leaving an entry only for centroids in needsScore.
+        final float[] suffixScores = new float[numCentroids];
+        final float[] scratch = new float[bulkSize];
+        // suffixContext.bytesPerVector() is the per-vector cost of the suffix scorer's data,
+        // which IS the suffix stride on disk (raw dim bytes + 16-byte correction footer).
+        final long suffixStride = suffixContext.bytesPerVector();
+        final OptimizedScalarQuantizer.QuantizationResult queryParams = suffixContext.queryParams();
+        final byte[] quantizedQuery = suffixContext.quantizedQuery();
+        centroids.seek(suffixRegionStart);
+        int i = 0;
+        final int fullBlockLimit = numCentroids - bulkSize + 1;
+        for (; i < fullBlockLimit; i += bulkSize) {
+            if (anyNeeded(needsScore, i, bulkSize)) {
+                suffixContext.scorer()
+                    .scoreBulk(
+                        quantizedQuery,
+                        queryParams.lowerInterval(),
+                        queryParams.upperInterval(),
+                        queryParams.quantizedComponentSum(),
+                        queryParams.additionalCorrection(),
+                        similarityFunction,
+                        centroidDp,
+                        scratch,
+                        bulkSize
+                    );
+                System.arraycopy(scratch, 0, suffixScores, i, bulkSize);
+            } else {
+                centroids.skipBytes((long) bulkSize * suffixStride);
+            }
         }
+        final int tail = numCentroids - i;
+        if (tail > 0) {
+            if (anyNeeded(needsScore, i, tail)) {
+                // LargeBitEncodedDiskBBQBulkWriter writes the trailing partial block with the
+                // same interleaved layout but with bulkSize=tail, so scoreBulk(tail) reads it
+                // exactly.
+                suffixContext.scorer()
+                    .scoreBulk(
+                        quantizedQuery,
+                        queryParams.lowerInterval(),
+                        queryParams.upperInterval(),
+                        queryParams.quantizedComponentSum(),
+                        queryParams.additionalCorrection(),
+                        similarityFunction,
+                        centroidDp,
+                        scratch,
+                        tail
+                    );
+                System.arraycopy(scratch, 0, suffixScores, i, tail);
+            } else {
+                centroids.skipBytes((long) tail * suffixStride);
+            }
+        }
+        // Push refined entries back into the queue.
+        for (int k = 0; k < refineCount; k++) {
+            final int ord = refinedIds[k];
+            final float refined = PrefixSuffixScoreCombiner.combine(similarityFunction, refinedPrefixScores[k], suffixScores[ord]);
+            neighborQueue.add(ord, refined);
+        }
+    }
+
+    private static boolean anyNeeded(boolean[] needsScore, int from, int len) {
+        for (int j = 0; j < len; j++) {
+            if (needsScore[from + j]) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
