@@ -162,6 +162,20 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 PrefixLayout.suffixLength(dimension)
             )
             : fullContext;
+        // Suffix-only scorer for top-K refinement: same OSQ quantization as the children scorer
+        // but over the suffix slice of the global centroid. Not consumed yet.
+        final ScoringContext suffixContext = splitLayout
+            ? buildScoringContext(
+                centroids,
+                scalarQuantizer,
+                targetQuery,
+                fieldEntry.globalCentroid(),
+                PrefixLayout.prefixLength(dimension),
+                PrefixLayout.suffixLength(dimension),
+                bulkSize,
+                /* suffixDim */ 0
+            )
+            : null;
         // build iterator
         CentroidIterator centroidIterator;
         if (numParents > 0) {
@@ -174,6 +188,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 numCentroids,
                 fullContext,
                 childrenContext,
+                suffixContext,
                 fieldEntry.globalCentroidDp(),
                 visitRatio * centroidOversampling,
                 acceptParents,
@@ -189,6 +204,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 centroids,
                 numCentroids,
                 childrenContext,
+                suffixContext,
                 fieldEntry.globalCentroidDp(),
                 acceptCentroids != null ? acceptCentroids : acceptParents,
                 bulkSize
@@ -237,8 +253,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // allocation we can skip cheaply is the slice copy when the request already covers the
         // whole array — taken below for the full-dim context, leaving the split-context path with
         // two unavoidable float[scorerDim] slice copies plus the required per-context scratch/
-        // residual/quantized arrays. Adding an offset/length variant to scalarQuantize would
-        // remove those copies but is intentionally out of scope for this commit.
+        // residual/quantized arrays. An offset/length variant of scalarQuantize would remove
+        // those copies.
         final float[] queryView = (from == 0 && scorerDim == targetQuery.length) ? targetQuery : sliceCopy(targetQuery, from, scorerDim);
         final float[] centroidView = (from == 0 && scorerDim == globalCentroid.length)
             ? globalCentroid
@@ -550,10 +566,12 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         IndexInput centroids,
         int numCentroids,
         ScoringContext ctx,
+        ScoringContext suffixContext,
         float globalCentroidDp,
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
+        assert suffixContext == null || ctx.suffixBytesPerVector() == suffixContext.prefixBytesPerVector();
         final NeighborQueue neighborQueue = new NeighborQueue(numCentroids, true);
         score(
             neighborQueue,
@@ -598,12 +616,16 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         int numCentroids,
         ScoringContext parentsCtx,
         ScoringContext childrenCtx,
+        ScoringContext suffixContext,
         float globalCentroidDp,
         float centroidRatio,
         FixedBitSet acceptParents,
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
+        // children suffix region is global (not grouped by parent); top-K refinement will address
+        // it by random-access seek into childrenOffset + numCentroids * prefixBytes.
+        assert suffixContext == null || childrenCtx.suffixBytesPerVector() == suffixContext.prefixBytesPerVector();
         // build the three queues we are going to use
         final long rawParentSize = (long) fieldInfo.getVectorDimension() * Float.BYTES;
         final long childrenTotalBytesPerVector = childrenCtx.prefixBytesPerVector() + childrenCtx.suffixBytesPerVector();
@@ -748,8 +770,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // The writer lays out ALL children's prefix bytes contiguously across parent groups
         // (see ESNextDiskBBQVectorsWriter.writeCentroidsWithParents), so we seek into the global
         // prefix region using only the prefix-byte stride. Suffix bytes for these children live
-        // in a separate global suffix region that is left untouched here and will be visited by
-        // the future top-K refinement pass (commit H).
+        // in a separate global suffix region addressed by random-access seek elsewhere.
         centroids.seek(childrenOffset + childrenCtx.prefixBytesPerVector() * childrenOrdinal);
         score(
             neighborQueue,
@@ -781,8 +802,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // we manipulate above, so it advances by exactly ctx.prefixBytesPerVector() per vector.
         // The caller decides what (if anything) to do about the matching suffix region:
         // * no-parents path: skip the trailing suffix region once after this call.
-        // * with-parents children path: do nothing — suffix region is global, addressed by
-        // random-access seek when commit H lands.
+        // * with-parents children path: do nothing — suffix region is global and is addressed by
+        // random-access seek elsewhere.
         final long prefixBytesPerVector = ctx.prefixBytesPerVector();
         final byte[] quantizeQuery = ctx.quantizedQuery();
         final OptimizedScalarQuantizer.QuantizationResult queryCorrections = ctx.queryParams();
