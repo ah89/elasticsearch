@@ -855,10 +855,24 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
                         + prefixLen
                 );
             }
+            // Suffix region is read by ESNextDiskBBQVectorsReader#refineTopKWithSuffix as ONE
+            // contiguous bulk-encoded stream that covers all numCentroids vectors. The prefix
+            // region above is written per parent group because the reader iterates it per parent
+            // group (one bulk stream per call), but refinement walks the whole suffix region in a
+            // single pass. Writing the suffix per parent group would emit one tail-framed mini-
+            // stream per group; the reader's single-stream scoreBulk would then misalign on the
+            // first parent boundary, returning garbage corrections and collapsing recall.
+            // Flatten the parent-group order into one ord mapping so the suffix lands as one
+            // bulk-encoded stream that the reader's layout assumption matches exactly.
+            final int totalChildren = (int) writtenCount;
+            final int[] flatOrds = new int[totalChildren];
+            int p = 0;
             for (int[] centroidVectors : centroidGroups.vectors()) {
-                childrenSplit.reset(idx -> centroidVectors[idx], centroidVectors.length);
-                bulkWriter.writeVectors(suffixView, null);
+                System.arraycopy(centroidVectors, 0, flatOrds, p, centroidVectors.length);
+                p += centroidVectors.length;
             }
+            childrenSplit.reset(idx -> flatOrds[idx], totalChildren);
+            bulkWriter.writeVectors(suffixView, null);
         } else {
             // small-dim fallback: keep the old single contiguous quantized children section.
             QuantizedCentroids childrenQuantizeCentroid = new QuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);

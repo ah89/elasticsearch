@@ -190,7 +190,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 fullContext,
                 childrenContext,
                 suffixContext,
-                fieldEntry.globalCentroidDp(),
                 visitRatio * centroidOversampling,
                 acceptParents,
                 acceptCentroids,
@@ -206,7 +205,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 numCentroids,
                 childrenContext,
                 suffixContext,
-                fieldEntry.globalCentroidDp(),
                 acceptCentroids != null ? acceptCentroids : acceptParents,
                 bulkSize
             );
@@ -239,7 +237,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         byte[] quantizedQuery,
         OptimizedScalarQuantizer.QuantizationResult queryParams,
         long bytesPerVector,
-        long trailingBytesPerVector
+        long trailingBytesPerVector,
+        float centroidDp
     ) {}
 
     private static ScoringContext buildScoringContext(
@@ -280,7 +279,11 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             quantized,
             queryParams,
             DiskBBQBulkWriter.largeBitBytesPerVector(scorerDim),
-            trailingDim == 0 ? 0L : DiskBBQBulkWriter.largeBitBytesPerVector(trailingDim)
+            trailingDim == 0 ? 0L : DiskBBQBulkWriter.largeBitBytesPerVector(trailingDim),
+            // Dot product of the slice of the global centroid that this scorer reads against
+            // itself — matches the convention used by the bulk scorer's centroidDp argument and
+            // by ES92Int7VectorsScorer#applyCorrections to recover the un-centered score.
+            ESVectorUtil.dotProduct(centroidView, centroidView)
         );
     }
 
@@ -571,7 +574,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         int numCentroids,
         ScoringContext ctx,
         ScoringContext suffixContext,
-        float globalCentroidDp,
         FixedBitSet acceptCentroids,
         int bulkSize
     ) throws IOException {
@@ -583,7 +585,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             0,
             centroids,
             ctx,
-            globalCentroidDp,
             fieldInfo.getVectorSimilarityFunction(),
             new float[bulkSize],
             acceptCentroids,
@@ -598,8 +599,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 numCentroids,
                 suffixContext,
                 bulkSize,
-                fieldInfo.getVectorSimilarityFunction(),
-                globalCentroidDp
+                fieldInfo.getVectorSimilarityFunction()
             );
         }
         // Land at the posting-offsets table. When the segment has a suffix region this skips past
@@ -634,7 +634,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         ScoringContext parentsCtx,
         ScoringContext childrenCtx,
         ScoringContext suffixContext,
-        float globalCentroidDp,
         float centroidRatio,
         FixedBitSet acceptParents,
         FixedBitSet acceptCentroids,
@@ -690,7 +689,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 0,
                 centroids,
                 parentsCtx,
-                globalCentroidDp,
                 fieldInfo.getVectorSimilarityFunction(),
                 scores,
                 acceptParents,
@@ -710,7 +708,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 childrenOffset,
                 childrenCtx,
                 fieldInfo,
-                globalCentroidDp,
                 scores,
                 acceptCentroids,
                 bulkSize
@@ -733,8 +730,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 numCentroids,
                 suffixContext,
                 bulkSize,
-                fieldInfo.getVectorSimilarityFunction(),
-                globalCentroidDp
+                fieldInfo.getVectorSimilarityFunction()
             );
         }
         // The posting offsets table follows the entire children section (prefix region + suffix
@@ -773,7 +769,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                         childrenOffset,
                         childrenCtx,
                         fieldInfo,
-                        globalCentroidDp,
                         scores,
                         acceptCentroids,
                         bulkSize
@@ -793,7 +788,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         long childrenOffset,
         ScoringContext childrenCtx,
         FieldInfo fieldInfo,
-        float globalCentroidDp,
         float[] scores,
         FixedBitSet acceptCentroids,
         int bulkSize
@@ -812,7 +806,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             childrenOrdinal,
             centroids,
             childrenCtx,
-            globalCentroidDp,
             fieldInfo.getVectorSimilarityFunction(),
             scores,
             acceptCentroids,
@@ -826,7 +819,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         int scoresOffset,
         IndexInput centroids,
         ScoringContext ctx,
-        float centroidDp,
         VectorSimilarityFunction similarityFunction,
         float[] scores,
         FixedBitSet acceptCentroids,
@@ -842,6 +834,11 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final long bytesPerVector = ctx.bytesPerVector();
         final byte[] quantizeQuery = ctx.quantizedQuery();
         final OptimizedScalarQuantizer.QuantizationResult queryCorrections = ctx.queryParams();
+        // Pull centroidDp from the context so it always matches the dimension slice this scorer
+        // reads. Passing a full-vector centroidDp into a prefix-only or suffix-only scorer
+        // biases every score by `D_global - D_slice`, which compounds across prefix + suffix in
+        // PrefixSuffixScoreCombiner and clamps refined scores to zero.
+        final float centroidDp = ctx.centroidDp();
         int limit = size - bulkSize + 1;
         int i = 0;
         for (; i < limit; i += bulkSize) {
@@ -933,8 +930,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         int numCentroids,
         ScoringContext suffixContext,
         int bulkSize,
-        VectorSimilarityFunction similarityFunction,
-        float centroidDp
+        VectorSimilarityFunction similarityFunction
     ) throws IOException {
         final int refineCount = Math.min(neighborQueue.size(), Math.max(REFINE_MIN, neighborQueue.size() / REFINE_FRACTION));
         if (refineCount == 0) {
@@ -961,6 +957,12 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final long suffixStride = suffixContext.bytesPerVector();
         final OptimizedScalarQuantizer.QuantizationResult queryParams = suffixContext.queryParams();
         final byte[] quantizedQuery = suffixContext.quantizedQuery();
+        // centroidDp must match the suffix slice that this scorer reads — using the full-vector
+        // centroidDp here biases every refined score downward by a constant, which
+        // PrefixSuffixScoreCombiner#combine then doubles when summing prefix + suffix. The
+        // double-bias clamps refined scores to zero, demoting the actually-good centroids below
+        // the un-refined ones and collapsing recall.
+        final float centroidDp = suffixContext.centroidDp();
         centroids.seek(suffixRegionStart);
         int i = 0;
         final int fullBlockLimit = numCentroids - bulkSize + 1;
