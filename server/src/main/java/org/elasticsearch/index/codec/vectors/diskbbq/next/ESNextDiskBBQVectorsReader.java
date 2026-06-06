@@ -137,7 +137,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final int bulkSize = fieldEntry.getBulkSize();
         final int dimension = fieldInfo.getVectorDimension();
         final OptimizedScalarQuantizer scalarQuantizer = new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction());
-        final boolean splitLayout = useSplitLayout(dimension, versionMeta);
+        final boolean splitLayout = useSplitLayout(dimension, versionMeta, fieldInfo.getVectorSimilarityFunction());
         final boolean needsFullContext = (splitLayout == false) || numParents > 0;
         final ScoringContext fullContext = needsFullContext
             ? buildScoringContext(
@@ -213,13 +213,25 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     }
 
     /**
-     * True when the on-disk centroid layout is the v2 prefix/suffix split. We require both the
-     * stream version to be {@code >= VERSION_PREFIX_SPLIT_CENTROIDS} <em>and</em> the dimension
-     * to trigger {@link PrefixLayout#isEnabled(int)}; the writer only emits the split when both
-     * are true (see {@code ESNextDiskBBQVectorsWriter.writeCentroidsWithoutParents}).
+     * Smallest dimension where splitting into a prefix/suffix is worth the extra per-query work
+     * (second scoring context, refinement pass, needsScore mask, combiner).
      */
-    private static boolean useSplitLayout(int dimension, int version) {
-        return version >= ESNextDiskBBQVectorsFormat.VERSION_PREFIX_SPLIT_CENTROIDS && PrefixLayout.isEnabled(dimension);
+    static final int MIN_PROFITABLE_SPLIT_DIMENSION = 512;
+
+    /**
+     * Whether to use the v2 prefix/suffix split layout. Must match
+     * {@code ESNextDiskBBQVectorsWriter#useSplitLayout} exactly or the reader will misread the file.
+     *
+     * <p>EUCLIDEAN is out. Until preconditioning lands, EUCLIDEAN
+     * goes through the full-dim path. COSINE / DOT_PRODUCT keep the split.
+     *
+     * <p>Dimension floor: see {@link #MIN_PROFITABLE_SPLIT_DIMENSION}.
+     */
+    private static boolean useSplitLayout(int dimension, int version, VectorSimilarityFunction similarityFunction) {
+        return version >= ESNextDiskBBQVectorsFormat.VERSION_PREFIX_SPLIT_CENTROIDS
+            && PrefixLayout.isEnabled(dimension)
+            && dimension >= MIN_PROFITABLE_SPLIT_DIMENSION
+            && similarityFunction != VectorSimilarityFunction.EUCLIDEAN;
     }
 
     /**

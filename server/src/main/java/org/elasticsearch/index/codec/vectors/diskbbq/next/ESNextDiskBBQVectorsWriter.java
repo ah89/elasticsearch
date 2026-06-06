@@ -806,7 +806,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
         }
 
         final int dimension = fieldInfo.getVectorDimension();
-        if (PrefixLayout.isEnabled(dimension)) {
+        if (useSplitLayout(dimension, fieldInfo.getVectorSimilarityFunction())) {
             // v2 split layout for the children section: drain prefixes for every parent group into
             // the prefix region first, then drain suffixes into the suffix region. We reuse a
             // single DiskBBQBulkWriter — it holds no cross-call framing state (no flush/finish/
@@ -910,7 +910,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
         // state (no flush/finish/close; every byte is written eagerly to the IndexOutput inside
         // writeVectors), so successive writeVectors calls land back-to-back in the centroid file.
         DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(7, BULK_SIZE, centroidOutput, true, true);
-        if (PrefixLayout.isEnabled(dimension)) {
+        if (useSplitLayout(dimension, fieldInfo.getVectorSimilarityFunction())) {
             // v2 split layout: write the prefix region first, then the suffix region. Both regions
             // are sized exactly numCentroids * bulkWriter.bytesPerVector(halfDim) bytes thanks to
             // bulk encoding, so the reader can compute the suffix region offset without any extra
@@ -1016,6 +1016,18 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
             vectorsPerCentroid[c][centroidVectorCount[c]++] = i;
         }
         return new CentroidGroups(kMeansResult.centroids(), vectorsPerCentroid, maxVectorsPerCentroidLength);
+    }
+
+    /**
+     * Whether the centroid file should be written in the v2 prefix/suffix split layout. Mirrors
+     * the reader-side decision in {@code ESNextDiskBBQVectorsReader#useSplitLayout}; both sides
+     * must agree exactly or the reader will misinterpret the on-disk byte layout. See that method
+     * for the full rationale behind excluding EUCLIDEAN and small dimensions.
+     */
+    static boolean useSplitLayout(int dimension, VectorSimilarityFunction similarityFunction) {
+        return PrefixLayout.isEnabled(dimension)
+            && dimension >= ESNextDiskBBQVectorsReader.MIN_PROFITABLE_SPLIT_DIMENSION
+            && similarityFunction != VectorSimilarityFunction.EUCLIDEAN;
     }
 
     @Override
