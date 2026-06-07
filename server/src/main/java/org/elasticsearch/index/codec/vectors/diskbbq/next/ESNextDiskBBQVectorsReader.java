@@ -915,33 +915,31 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     private static final int REFINE_FRACTION = 10;
 
     /**
-     * Per-query bypass threshold for {@link #refineTopKWithSuffix}. Once the prefix-only top-K is
-     * drained, if the relative gap between the best and worst prefix scores in the to-be-refined
-     * window exceeds this ratio
-     * (<code>(best - worst) / max(|best|, EPS) &gt; REFINE_BYPASS_RATIO</code>),
-     * we declare the prefix decisive and push the prefix-only scores back to the queue without
-     * scanning the suffix region. The heuristic trades a small recall risk (when the suffix
-     * contribution happens to flip ordering within a wide-spread window) for one fewer pass over
-     * the suffix bytes per query.
+     * Per-query bypass threshold for {@link #refineTopKWithSuffix}: skip the suffix pass when
+     * <code>(best - worst) / max(|best|, EPS) &gt; REFINE_BYPASS_RATIO</code> across the
+     * to-be-refined window. Default is {@link Float#POSITIVE_INFINITY} — bypass is off.
      *
-     * <p>Using a <em>relative</em> gap keeps the threshold meaningful across similarity functions
-     * with very different score scales (cosine in [-1, 1] vs un-normalized dot_product). Set the
-     * system property {@code org.elasticsearch.diskbbq.refineBypassRatio} to
-     * {@link Float#POSITIVE_INFINITY} (or any large value) to disable bypass entirely and recover
-     * the pre-bypass behavior; set it lower to bypass more aggressively. Default tuned to be
-     * mildly aggressive — refine when in doubt — and worth re-tuning with benchmarks.
+     * <p>Why off by default: a relative-gap threshold is a crude proxy for "suffix can't reorder
+     * the top-K", and on benchmarks of cosine workloads (wiki/Cohere, 768d) any setting we tried
+     * cost 2-3 points of recall at low visit% in exchange for only ~5-10% extra QPS — a bad trade
+     * for vector search. Opt back in for experimentation via the system property
+     * {@code org.elasticsearch.diskbbq.refineBypassRatio}; the unit tests in
+     * {@code ESNextRefineBypassTests} cover the math. A principled re-enable would replace the
+     * relative-gap check with a comparison against the per-query maximum possible suffix score
+     * contribution (e.g. derived from query norm and suffix dim), which the current heuristic
+     * does not compute.
      */
     private static final float REFINE_BYPASS_RATIO = readBypassRatio();
 
     private static float readBypassRatio() {
         final String prop = System.getProperty("org.elasticsearch.diskbbq.refineBypassRatio");
         if (prop == null) {
-            return 0.25f;
+            return Float.POSITIVE_INFINITY;
         }
         try {
             return Float.parseFloat(prop);
         } catch (NumberFormatException e) {
-            return 0.25f;
+            return Float.POSITIVE_INFINITY;
         }
     }
 
