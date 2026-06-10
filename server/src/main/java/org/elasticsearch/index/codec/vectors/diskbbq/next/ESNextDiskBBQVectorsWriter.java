@@ -855,15 +855,16 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
                         + prefixLen
                 );
             }
-            // Suffix region is read by ESNextDiskBBQVectorsReader#refineTopKWithSuffix as ONE
-            // contiguous bulk-encoded stream that covers all numCentroids vectors. The prefix
-            // region above is written per parent group because the reader iterates it per parent
-            // group (one bulk stream per call), but refinement walks the whole suffix region in a
-            // single pass. Writing the suffix per parent group would emit one tail-framed mini-
-            // stream per group; the reader's single-stream scoreBulk would then misalign on the
-            // first parent boundary, returning garbage corrections and collapsing recall.
-            // Flatten the parent-group order into one ord mapping so the suffix lands as one
-            // bulk-encoded stream that the reader's layout assumption matches exactly.
+            // Per-vector suffix layout: every centroid's suffix bytes land as
+            // [dim bytes][3 floats][1 int] back-to-back, matching ES92Int7VectorsScorer#score so
+            // the reader (see ESNextDiskBBQVectorsReader#refineQueueTopOnDemand) can random-access
+            // a single centroid via seek + score(), enabling lazy iterator-driven refinement.
+            //
+            // Flatten the parent-group order into one ord mapping so suffix[i] corresponds to the
+            // same centroid that prefix[i] does. The prefix region above is written per parent
+            // group, so the reader's "ord" indexes into the flattened parent-grouped order. Writing
+            // the suffix in flatOrds order keeps suffix[i] aligned with prefix[i] so the reader's
+            // seek formula (suffixRegionStart + ord * stride) lands on the right centroid's bytes.
             final int totalChildren = (int) writtenCount;
             final int[] flatOrds = new int[totalChildren];
             int p = 0;
@@ -872,7 +873,10 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
                 p += centroidVectors.length;
             }
             childrenSplit.reset(idx -> flatOrds[idx], totalChildren);
-            bulkWriter.writeVectors(suffixView, null);
+            for (int i = 0; i < totalChildren; i++) {
+                byte[] qv = suffixView.next();
+                DiskBBQBulkWriter.writeLargeBitVectorPerVector(centroidOutput, qv, suffixView.getCorrections());
+            }
         } else {
             // small-dim fallback: keep the old single contiguous quantized children section.
             QuantizedCentroids childrenQuantizeCentroid = new QuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);
@@ -911,10 +915,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
         // writeVectors), so successive writeVectors calls land back-to-back in the centroid file.
         DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(7, BULK_SIZE, centroidOutput, true, true);
         if (useSplitLayout(dimension, fieldInfo.getVectorSimilarityFunction())) {
-            // v2 split layout: write the prefix region first, then the suffix region. Both regions
-            // are sized exactly numCentroids * bulkWriter.bytesPerVector(halfDim) bytes thanks to
-            // bulk encoding, so the reader can compute the suffix region offset without any extra
-            // header field.
+            // Write prefix region (bulk-encoded) then suffix region (per-vector). Both resolve to
+            // the same per-vector byte cost for 7-bit LargeBit, so the reader can compute either
+            // region's offset without an extra header field.
             PrefixQuantizedCentroids split = new PrefixQuantizedCentroids(centroidSupplier, dimension, osq, globalCentroid);
             // See writeCentroidsWithParents for the rationale: guard the cross-class invariant
             // "PrefixLayout.isEnabled(dim) ⇒ suffixView() != null" so any future drift fails here
@@ -941,7 +944,11 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter {
                         + prefixLen
                 );
             }
-            bulkWriter.writeVectors(suffixView, null);
+            // Per-vector suffix layout — see writeCentroidsWithParents for the rationale.
+            for (int i = 0; i < numCentroids; i++) {
+                byte[] qv = suffixView.next();
+                DiskBBQBulkWriter.writeLargeBitVectorPerVector(centroidOutput, qv, suffixView.getCorrections());
+            }
         } else {
             // small-dim fallback: prefix == full vector, no suffix region. Keep the existing single
             // contiguous quantized section. v2 readers handle this by treating prefixLen == dim.

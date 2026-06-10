@@ -61,6 +61,18 @@ public abstract sealed class DiskBBQBulkWriter {
         return dimension + 3 * Float.BYTES + Integer.BYTES;
     }
 
+    public static void writeLargeBitVectorPerVector(
+        IndexOutput out,
+        byte[] quantizedVector,
+        OptimizedScalarQuantizer.QuantizationResult correction
+    ) throws IOException {
+        out.writeBytes(quantizedVector, quantizedVector.length);
+        out.writeInt(Float.floatToIntBits(correction.lowerInterval()));
+        out.writeInt(Float.floatToIntBits(correction.upperInterval()));
+        out.writeInt(Float.floatToIntBits(correction.additionalCorrection()));
+        out.writeInt(correction.quantizedComponentSum());
+    }
+
     /**
      * Factory method to create a DiskBBQBulkWriter based on the bit size.
      * @param bitSize the bit size of the quantized vectors
