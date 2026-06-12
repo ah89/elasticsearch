@@ -604,17 +604,21 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         );
         final long suffixRegionStart = centroids.getFilePointer();
         // Lazy-refinement state: refined[] tracks which ords are done; budget[0] is the remaining
-        // cap. Both are mutated by refineQueueTopOnDemand before each emit.
+        // cap. Both are mutated by refineQueueTopOnDemand before each emit. When the per-query
+        // bypass triggers (wide prefix-score gap), lazySuffixContext stays null so the suffix pass
+        // is skipped entirely and centroids are emitted with prefix-only scores.
         final boolean[] lazyRefined;
         final int[] lazyBudget;
-        if (suffixContext != null && neighborQueue.size() > 0) {
+        final ScoringContext lazySuffixContext;
+        if (suffixContext != null && neighborQueue.size() > 0 && bypassRefinement(neighborQueue, REFINE_BYPASS_RATIO) == false) {
             lazyRefined = new boolean[numCentroids];
             lazyBudget = new int[] { lazyRefinementBudget(neighborQueue.size()) };
+            lazySuffixContext = suffixContext;
         } else {
             lazyRefined = null;
             lazyBudget = null;
+            lazySuffixContext = null;
         }
-        final ScoringContext lazySuffixContext = suffixContext;
         final VectorSimilarityFunction lazySimilarity = fieldInfo.getVectorSimilarityFunction();
         // Land at the posting-offsets table. When the segment has a suffix region this skips past
         // it; when it doesn't, ctx.trailingBytesPerVector() == 0 and the seek is a no-op.
@@ -749,14 +753,18 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final long childrenSuffixRegionStart = childrenOffset + childrenCtx.bytesPerVector() * numCentroids;
         final boolean[] lazyRefined;
         final int[] lazyBudget;
-        if (suffixContext != null && neighborQueue.size() > 0) {
+        final ScoringContext lazySuffixContext;
+        // Same per-query bypass as the no-parents path: a wide prefix-score gap across the initial
+        // fill means suffix scoring is unlikely to reorder it, so skip the suffix pass entirely.
+        if (suffixContext != null && neighborQueue.size() > 0 && bypassRefinement(neighborQueue, REFINE_BYPASS_RATIO) == false) {
             lazyRefined = new boolean[numCentroids];
             lazyBudget = new int[] { lazyRefinementBudget(neighborQueue.size()) };
+            lazySuffixContext = suffixContext;
         } else {
             lazyRefined = null;
             lazyBudget = null;
+            lazySuffixContext = null;
         }
-        final ScoringContext lazySuffixContext = suffixContext;
         final VectorSimilarityFunction lazySimilarity = fieldInfo.getVectorSimilarityFunction();
         // The posting offsets table follows the entire children section (prefix region + suffix
         // region for split layouts). childrenTotalBytesPerVector covers both regions per child.
@@ -938,6 +946,32 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
 
     private static final int REFINE_FRACTION = 10;
 
+    /**
+     * Per-query bypass threshold for the suffix-refinement step. When the prefix-only scores of the
+     * to-be-refined window are spread wider than this relative gap, suffix scoring is unlikely to
+     * reorder the emitted centroids, so {@link #bypassRefinement} skips the entire suffix pass for
+     * that query — trading a small recall risk for skipping every suffix seek + score.
+     *
+     * <p>Default is {@link Float#POSITIVE_INFINITY} (bypass disabled): a relative-gap threshold is a
+     * crude proxy for "suffix can't reorder the top-K", and on cosine workloads (wiki/Cohere, 768d)
+     * the settings we tried cost 2-3 points of recall at low visit% for only ~5-10% extra QPS. The
+     * knob is wired in and honoured when set, but stays off by default so recall is preserved unless
+     * an operator explicitly opts in via the system property
+     * {@code org.elasticsearch.diskbbq.refineBypassRatio}.
+     */
+    private static final float REFINE_BYPASS_RATIO = readBypassRatio();
+
+    private static float readBypassRatio() {
+        final String prop = System.getProperty("org.elasticsearch.diskbbq.refineBypassRatio");
+        if (prop == null) {
+            return Float.POSITIVE_INFINITY;
+        }
+        try {
+            return Float.parseFloat(prop);
+        } catch (NumberFormatException e) {
+            return Float.POSITIVE_INFINITY;
+        }
+    }
 
     /**
      * Refines the queue top on demand: seeks to the centroid's per-vector suffix bytes and
@@ -995,6 +1029,66 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         return Math.min(queueSize, Math.max(REFINE_MIN, queueSize / REFINE_FRACTION));
     }
 
+    /**
+     * Per-query decision: should the suffix-refinement pass be skipped entirely for this query?
+     *
+     * <p>Reads the prefix-only scores of the top {@link #lazyRefinementBudget} window in best-first
+     * order and applies {@link #shouldBypassRefinement}. The window is read by draining the top
+     * entries (a MAX_HEAP {@code popRaw()} yields descending scores) and immediately re-adding them,
+     * so the queue is left logically unchanged before iteration begins. Short-circuits to
+     * {@code false} with no queue work when {@code ratio} is disabled (non-finite or non-positive),
+     * so there is zero per-query overhead unless an operator opts in via {@link #REFINE_BYPASS_RATIO}.
+     *
+     * @param neighborQueue the populated, prefix-scored centroid queue; left unchanged on return
+     * @param ratio         the configured relative-gap threshold; {@link Float#POSITIVE_INFINITY}
+     *                      (or any non-positive value) disables bypass
+     */
+    static boolean bypassRefinement(NeighborQueue neighborQueue, float ratio) {
+        if (Float.isFinite(ratio) == false || ratio <= 0f) {
+            return false;
+        }
+        final int refineCount = lazyRefinementBudget(neighborQueue.size());
+        if (refineCount <= 1) {
+            return false;
+        }
+        final long[] held = new long[refineCount];
+        final float[] windowScores = new float[refineCount];
+        for (int k = 0; k < refineCount; k++) {
+            final long raw = neighborQueue.popRaw();
+            held[k] = raw;
+            windowScores[k] = neighborQueue.decodeScore(raw);
+        }
+        // Restore the queue: re-encode each decoded node/score so the heap is identical to before.
+        for (int k = 0; k < refineCount; k++) {
+            neighborQueue.add(neighborQueue.decodeNodeId(held[k]), windowScores[k]);
+        }
+        return shouldBypassRefinement(windowScores, refineCount, ratio);
+    }
+
+    /**
+     * Returns true when the prefix-only ranking of the to-be-refined window is wide enough that
+     * suffix scoring cannot plausibly change the top-K: divide the best-vs-worst prefix gap by the
+     * best score's magnitude and compare to {@code bypassRatio}. Pulled out as a package-private
+     * static helper so the heuristic can be unit-tested without spinning up a full segment.
+     *
+     * <p>Returns false for {@code refineCount <= 1} (a single-element window has nothing to reorder
+     * so the gap is undefined) and for non-positive ratios (caller wants bypass disabled).
+     *
+     * @param refinedPrefixScores prefix-only scores in best-first order (as drained from a max-K
+     *                            {@link NeighborQueue} via {@code popRaw})
+     * @param refineCount         number of valid entries at the head of {@code refinedPrefixScores}
+     * @param bypassRatio         relative-gap threshold above which bypass triggers; pass
+     *                            {@link Float#POSITIVE_INFINITY} to disable bypass entirely
+     */
+    static boolean shouldBypassRefinement(float[] refinedPrefixScores, int refineCount, float bypassRatio) {
+        if (refineCount <= 1 || bypassRatio <= 0f) {
+            return false;
+        }
+        final float bestPrefix = refinedPrefixScores[0];
+        final float worstPrefix = refinedPrefixScores[refineCount - 1];
+        final float relativeGap = (bestPrefix - worstPrefix) / Math.max(Math.abs(bestPrefix), 1e-12f);
+        return relativeGap > bypassRatio;
+    }
 
     @Override
     public PostingVisitor getPostingVisitor(
