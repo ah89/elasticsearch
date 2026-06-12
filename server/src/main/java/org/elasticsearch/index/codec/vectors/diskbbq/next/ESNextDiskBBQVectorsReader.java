@@ -938,35 +938,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
 
     private static final int REFINE_FRACTION = 10;
 
-    /**
-     * Per-query bypass threshold for the suffix-refinement step (see
-     * {@link #refineQueueTopOnDemand}): skip the suffix pass when
-     * <code>(best - worst) / max(|best|, EPS) &gt; REFINE_BYPASS_RATIO</code> across the
-     * to-be-refined window. Default is {@link Float#POSITIVE_INFINITY} — bypass is off.
-     *
-     * <p>Why off by default: a relative-gap threshold is a crude proxy for "suffix can't reorder
-     * the top-K", and on benchmarks of cosine workloads (wiki/Cohere, 768d) any setting we tried
-     * cost 2-3 points of recall at low visit% in exchange for only ~5-10% extra QPS — a bad trade
-     * for vector search. Opt back in for experimentation via the system property
-     * {@code org.elasticsearch.diskbbq.refineBypassRatio}; the unit tests in
-     * {@code ESNextRefineBypassTests} cover the math. A principled re-enable would replace the
-     * relative-gap check with a comparison against the per-query maximum possible suffix score
-     * contribution (e.g. derived from query norm and suffix dim), which the current heuristic
-     * does not compute.
-     */
-    private static final float REFINE_BYPASS_RATIO = readBypassRatio();
-
-    private static float readBypassRatio() {
-        final String prop = System.getProperty("org.elasticsearch.diskbbq.refineBypassRatio");
-        if (prop == null) {
-            return Float.POSITIVE_INFINITY;
-        }
-        try {
-            return Float.parseFloat(prop);
-        } catch (NumberFormatException e) {
-            return Float.POSITIVE_INFINITY;
-        }
-    }
 
     /**
      * Refines the queue top on demand: seeks to the centroid's per-vector suffix bytes and
@@ -1024,41 +995,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         return Math.min(queueSize, Math.max(REFINE_MIN, queueSize / REFINE_FRACTION));
     }
 
-    private static boolean anyNeeded(boolean[] needsScore, int from, int len) {
-        for (int j = 0; j < len; j++) {
-            if (needsScore[from + j]) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Returns true when the prefix-only ranking of the to-be-refined window is wide enough that
-     * suffix scoring cannot plausibly change the top-K. The check is the same one described on
-     * {@link #REFINE_BYPASS_RATIO}: divide the best-vs-worst prefix gap by the best score's
-     * magnitude, compare to the configured ratio. Pulled out as a package-private static helper
-     * so the heuristic can be unit-tested without spinning up a full segment.
-     *
-     * <p>Returns false for {@code refineCount <= 1} (a single-element window has nothing to
-     * reorder so the gap is undefined) and for non-positive ratios (caller wants to disable
-     * bypass).
-     *
-     * @param refinedPrefixScores prefix-only scores in best-first order (as drained from a max-K
-     *                            {@link NeighborQueue} via {@code popRaw})
-     * @param refineCount         number of valid entries at the head of {@code refinedPrefixScores}
-     * @param bypassRatio         relative-gap threshold above which bypass triggers; pass
-     *                            {@link Float#POSITIVE_INFINITY} to disable bypass entirely
-     */
-    static boolean shouldBypassRefinement(float[] refinedPrefixScores, int refineCount, float bypassRatio) {
-        if (refineCount <= 1 || bypassRatio <= 0f) {
-            return false;
-        }
-        final float bestPrefix = refinedPrefixScores[0];
-        final float worstPrefix = refinedPrefixScores[refineCount - 1];
-        final float relativeGap = (bestPrefix - worstPrefix) / Math.max(Math.abs(bestPrefix), 1e-12f);
-        return relativeGap > bypassRatio;
-    }
 
     @Override
     public PostingVisitor getPostingVisitor(
