@@ -624,35 +624,22 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // it; when it doesn't, ctx.trailingBytesPerVector() == 0 and the seek is a no-op.
         final long offset = suffixRegionStart + (long) numCentroids * ctx.trailingBytesPerVector();
         centroids.seek(offset);
-        return new CentroidIterator() {
-            @Override
-            public boolean hasNext() {
-                return neighborQueue.size() > 0;
-            }
-
-            @Override
-            public PostingMetadata nextPosting() throws IOException {
-                if (lazySuffixContext != null) {
-                    refineQueueTopOnDemand(
-                        neighborQueue,
-                        lazyRefined,
-                        lazyBudget,
-                        centroids,
-                        suffixRegionStart,
-                        lazySuffixContext,
-                        lazySimilarity
-                    );
-                }
-                long centroidOrdinalAndScore = neighborQueue.popRaw();
-                int centroidOrd = neighborQueue.decodeNodeId(centroidOrdinalAndScore);
-                float score = neighborQueue.decodeScore(centroidOrdinalAndScore);
-                centroids.seek(offset + (long) Long.BYTES * 2 * centroidOrd);
-                long postingListOffset = centroids.readLong();
-                long postingListLength = centroids.readLong();
-                // NO_ORDINAL indicates that the global centroid should be used for query quantization
-                return new PostingMetadata(postingListOffset, postingListLength, NO_ORDINAL, score);
-            }
-        };
+        // Flat layout: the queue is fully populated, so each emit just pops the best remaining
+        // centroid. The posting-offset record is two longs (offset, length) and carries no parent
+        // ordinal, so NO_ORDINAL is emitted (the global centroid is used for query quantization).
+        return new RefiningCentroidIterator(
+            neighborQueue,
+            neighborQueue::popRaw,
+            lazyRefined,
+            lazyBudget,
+            lazySuffixContext,
+            lazySimilarity,
+            centroids,
+            suffixRegionStart,
+            offset,
+            Long.BYTES * 2,
+            false
+        );
     }
 
     private static CentroidIterator getCentroidIteratorWithParents(
@@ -769,43 +756,17 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // The posting offsets table follows the entire children section (prefix region + suffix
         // region for split layouts). childrenTotalBytesPerVector covers both regions per child.
         final long childrenFileOffsets = childrenOffset + childrenTotalBytesPerVector * numCentroids;
-        return new CentroidIterator() {
-
-            @Override
-            public boolean hasNext() {
-                return neighborQueue.size() > 0;
-            }
-
-            @Override
-            public PostingMetadata nextPosting() throws IOException {
-                if (lazySuffixContext != null) {
-                    refineQueueTopOnDemand(
-                        neighborQueue,
-                        lazyRefined,
-                        lazyBudget,
-                        centroids,
-                        childrenSuffixRegionStart,
-                        lazySuffixContext,
-                        lazySimilarity
-                    );
-                }
-                long centroidOrdinalAndScore = nextCentroid();
-                int centroidOrdinal = neighborQueue.decodeNodeId(centroidOrdinalAndScore);
-                float score = neighborQueue.decodeScore(centroidOrdinalAndScore);
-                centroids.seek(childrenFileOffsets + (long) (Long.BYTES * 2 + Integer.BYTES) * centroidOrdinal);
-                long postingListOffset = centroids.readLong();
-                long postingListLength = centroids.readLong();
-                int parentOrd = centroids.readInt();
-                return new PostingMetadata(postingListOffset, postingListLength, parentOrd, score);
-            }
-
-            private long nextCentroid() throws IOException {
+        // Hierarchical layout: the queue is topped up on demand from each parent's children, so the
+        // supplier advances to the next parent group once the current one is exhausted before
+        // popping. The posting-offset record additionally carries the parent ordinal.
+        final RawCentroidSupplier nextChild = () -> {
+            while (true) {
                 if (currentParentQueue.size() > 0) {
                     // return next centroid and maybe add a children from the current parent queue
                     return neighborQueue.popRawAndAddRaw(currentParentQueue.popRaw());
                 } else if (parentsQueue.size() > 0) {
                     // current parent queue is empty, populate it again with the next parent
-                    int pop = parentsQueue.pop();
+                    final int pop = parentsQueue.pop();
                     populateOneChildrenGroup(
                         currentParentQueue,
                         centroids,
@@ -817,12 +778,24 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                         acceptCentroids,
                         bulkSize
                     );
-                    return nextCentroid();
                 } else {
                     return neighborQueue.popRaw();
                 }
             }
         };
+        return new RefiningCentroidIterator(
+            neighborQueue,
+            nextChild,
+            lazyRefined,
+            lazyBudget,
+            lazySuffixContext,
+            lazySimilarity,
+            centroids,
+            childrenSuffixRegionStart,
+            childrenFileOffsets,
+            Long.BYTES * 2 + Integer.BYTES,
+            true
+        );
     }
 
     private static void populateOneChildrenGroup(
@@ -934,6 +907,89 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             } else {
                 centroids.skipBytes(tailBulkSize * bytesPerVector);
             }
+        }
+    }
+
+    /**
+     * Supplies the next raw {@code (ordinal, score)} entry from a centroid queue, popping it.
+     * The hierarchical layout uses this hook to top the queue up from a parent's children (and
+     * advance to the next parent group) before popping; the flat layout simply pops the queue.
+     * Pulled out so {@link RefiningCentroidIterator} can drive both layouts without duplicating the
+     * refine-then-emit boilerplate.
+     */
+    @FunctionalInterface
+    private interface RawCentroidSupplier {
+        long next() throws IOException;
+    }
+
+    /**
+     * {@link CentroidIterator} that lazily refines the queue top against the suffix region (on split
+     * layouts) before reading each centroid's posting metadata. Extracted into a named type — rather
+     * than an anonymous iterator per call site — so the refine -&gt; pop -&gt; read flow is readable
+     * and shared between the flat and hierarchical centroid layouts, which differ only in how the
+     * next queue entry is produced ({@link RawCentroidSupplier}) and how wide each posting-offset
+     * record is ({@code postingRecordBytes}, plus whether a trailing parent ordinal is present).
+     */
+    private static final class RefiningCentroidIterator implements CentroidIterator {
+        private final NeighborQueue neighborQueue;
+        private final RawCentroidSupplier nextRaw;
+        private final boolean[] refined;
+        private final int[] remainingBudget;
+        private final ScoringContext suffixContext;
+        private final VectorSimilarityFunction similarity;
+        private final IndexInput centroids;
+        private final long suffixRegionStart;
+        private final long postingOffsetsStart;
+        private final int postingRecordBytes;
+        private final boolean readsParentOrdinal;
+
+        RefiningCentroidIterator(
+            NeighborQueue neighborQueue,
+            RawCentroidSupplier nextRaw,
+            boolean[] refined,
+            int[] remainingBudget,
+            ScoringContext suffixContext,
+            VectorSimilarityFunction similarity,
+            IndexInput centroids,
+            long suffixRegionStart,
+            long postingOffsetsStart,
+            int postingRecordBytes,
+            boolean readsParentOrdinal
+        ) {
+            this.neighborQueue = neighborQueue;
+            this.nextRaw = nextRaw;
+            this.refined = refined;
+            this.remainingBudget = remainingBudget;
+            this.suffixContext = suffixContext;
+            this.similarity = similarity;
+            this.centroids = centroids;
+            this.suffixRegionStart = suffixRegionStart;
+            this.postingOffsetsStart = postingOffsetsStart;
+            this.postingRecordBytes = postingRecordBytes;
+            this.readsParentOrdinal = readsParentOrdinal;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return neighborQueue.size() > 0;
+        }
+
+        @Override
+        public PostingMetadata nextPosting() throws IOException {
+            // A null suffixContext means there is no suffix region (or refinement was bypassed for
+            // this query), so the queue's prefix-only scores are emitted unchanged.
+            if (suffixContext != null) {
+                refineQueueTopOnDemand(neighborQueue, refined, remainingBudget, centroids, suffixRegionStart, suffixContext, similarity);
+            }
+            final long centroidOrdinalAndScore = nextRaw.next();
+            final int centroidOrdinal = neighborQueue.decodeNodeId(centroidOrdinalAndScore);
+            final float score = neighborQueue.decodeScore(centroidOrdinalAndScore);
+            centroids.seek(postingOffsetsStart + (long) postingRecordBytes * centroidOrdinal);
+            final long postingListOffset = centroids.readLong();
+            final long postingListLength = centroids.readLong();
+            // NO_ORDINAL indicates that the global centroid should be used for query quantization
+            final int parentOrdinal = readsParentOrdinal ? centroids.readInt() : NO_ORDINAL;
+            return new PostingMetadata(postingListOffset, postingListLength, parentOrdinal, score);
         }
     }
 
