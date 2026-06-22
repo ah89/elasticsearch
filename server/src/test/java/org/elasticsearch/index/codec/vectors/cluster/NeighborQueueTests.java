@@ -132,4 +132,73 @@ public class NeighborQueueTests extends ESTestCase {
         assertEquals(first, nn.peek());
     }
 
+    public void testUpdateTopDemotesWhenScoreLowered() {
+        // max-heap: highest score on top. Lowering the top's score below a sibling must demote it,
+        // exactly as a pop()+add() of the new score would, but in a single sift-down.
+        NeighborQueue nn = new NeighborQueue(3, true);
+        nn.add(1, 0.9f);
+        nn.add(2, 0.8f);
+        nn.add(3, 0.7f);
+        assertEquals(1, nn.topNode());
+        assertEquals(0.9f, nn.topScore(), 0);
+
+        // Refine node 1: its combined score (0.65) drops below nodes 2 and 3.
+        nn.updateTop(1, 0.65f);
+        assertEquals(3, nn.size());
+        assertEquals(2, nn.topNode());
+        assertEquals(0.8f, nn.topScore(), 0);
+
+        nn.pop();
+        assertEquals(3, nn.topNode());
+        assertEquals(0.7f, nn.topScore(), 0);
+        nn.pop();
+        assertEquals(1, nn.topNode());
+        assertEquals(0.65f, nn.topScore(), 0);
+    }
+
+    public void testUpdateTopKeepsTopWhenStillBest() {
+        // When the replacement score keeps the element as the maximum, the single sift-down must
+        // leave it on top (a refined score that is still the best need not move).
+        NeighborQueue nn = new NeighborQueue(3, true);
+        nn.add(1, 0.9f);
+        nn.add(2, 0.8f);
+        nn.add(3, 0.7f);
+        assertEquals(1, nn.topNode());
+
+        nn.updateTop(1, 0.85f);
+        assertEquals(3, nn.size());
+        assertEquals(1, nn.topNode());
+        assertEquals(0.85f, nn.topScore(), 0);
+    }
+
+    public void testUpdateTopMatchesPopThenAdd() {
+        // Property: re-scoring the top via updateTop yields the same heap contents (same drained
+        // order) as an explicit popRaw()+add() of the new score. Randomized to guard the invariant.
+        final int n = randomIntBetween(2, 64);
+        NeighborQueue viaUpdate = new NeighborQueue(n, true);
+        NeighborQueue viaPopAdd = new NeighborQueue(n, true);
+        for (int i = 0; i < n; i++) {
+            final float score = random().nextFloat();
+            viaUpdate.add(i, score);
+            viaPopAdd.add(i, score);
+        }
+        final int topNode = viaUpdate.topNode();
+        // A refined score never exceeds the prefix score it replaces, so lower the top's score.
+        final float lowered = viaUpdate.topScore() - random().nextFloat();
+
+        viaUpdate.updateTop(topNode, lowered);
+
+        final long raw = viaPopAdd.popRaw();
+        assertEquals(topNode, viaPopAdd.decodeNodeId(raw));
+        viaPopAdd.add(topNode, lowered);
+
+        assertEquals(viaPopAdd.size(), viaUpdate.size());
+        while (viaUpdate.size() > 0) {
+            assertEquals(viaPopAdd.topNode(), viaUpdate.topNode());
+            assertEquals(viaPopAdd.topScore(), viaUpdate.topScore(), 0);
+            viaPopAdd.pop();
+            viaUpdate.pop();
+        }
+    }
+
 }

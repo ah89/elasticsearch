@@ -156,6 +156,24 @@ public class NeighborQueue {
         return top;
     }
 
+    /**
+     * Replaces the score (and node id) of the current top element with {@code (newNode, newScore)}
+     * and re-establishes the heap invariant with a single sift-down, rather than the two heap
+     * operations a {@link #popRaw()} followed by {@link #add(int, float)} would cost.
+     *
+     * <p>This is the correct primitive for re-scoring the element that is currently on top: a
+     * sift-down restores the heap whether the new score keeps the element on top (e.g. it is still
+     * the maximum of a max-heap) or demotes it. Callers that lower the top's score — such as
+     * centroid suffix refinement, where a refined score never exceeds the prefix-only score it
+     * replaces — therefore avoid the redundant sift-up that {@code add} performs after a {@code pop}.
+     *
+     * @param newNode  the node id to store at the top position
+     * @param newScore the replacement score for the top element
+     */
+    public void updateTop(int newNode, float newScore) {
+        heap.updateTop(encode(newNode, newScore));
+    }
+
     public void clear() {
         heap.clear();
     }

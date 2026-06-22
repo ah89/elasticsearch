@@ -244,7 +244,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
      * disk; non-zero only for the children context of a v2 split layout, whose data is followed
      * by the global suffix region.
      */
-    private record ScoringContext(
+    record ScoringContext(
         ES92Int7VectorsScorer scorer,
         byte[] quantizedQuery,
         OptimizedScalarQuantizer.QuantizationResult queryParams,
@@ -942,6 +942,12 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         private final long postingOffsetsStart;
         private final int postingRecordBytes;
         private final boolean readsParentOrdinal;
+        // Bulk-refinement scratch, allocated once per iterator only when chunking is enabled and a
+        // suffix region exists. null when refineChunkSize == 1 (the one-at-a-time updateTop path).
+        private final int refineChunkSize;
+        private final int[] chunkOrds;
+        private final float[] chunkPrefix;
+        private final float[] chunkCombined;
 
         RefiningCentroidIterator(
             NeighborQueue neighborQueue,
@@ -967,6 +973,16 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             this.postingOffsetsStart = postingOffsetsStart;
             this.postingRecordBytes = postingRecordBytes;
             this.readsParentOrdinal = readsParentOrdinal;
+            this.refineChunkSize = REFINE_CHUNK;
+            if (suffixContext != null && refineChunkSize > 1) {
+                this.chunkOrds = new int[refineChunkSize];
+                this.chunkPrefix = new float[refineChunkSize];
+                this.chunkCombined = new float[refineChunkSize];
+            } else {
+                this.chunkOrds = null;
+                this.chunkPrefix = null;
+                this.chunkCombined = null;
+            }
         }
 
         @Override
@@ -979,7 +995,31 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             // A null suffixContext means there is no suffix region (or refinement was bypassed for
             // this query), so the queue's prefix-only scores are emitted unchanged.
             if (suffixContext != null) {
-                refineQueueTopOnDemand(neighborQueue, refined, remainingBudget, centroids, suffixRegionStart, suffixContext, similarity);
+                if (refineChunkSize > 1) {
+                    refineQueueChunkOnDemand(
+                        neighborQueue,
+                        refined,
+                        remainingBudget,
+                        centroids,
+                        suffixRegionStart,
+                        suffixContext,
+                        similarity,
+                        refineChunkSize,
+                        chunkOrds,
+                        chunkPrefix,
+                        chunkCombined
+                    );
+                } else {
+                    refineQueueTopOnDemand(
+                        neighborQueue,
+                        refined,
+                        remainingBudget,
+                        centroids,
+                        suffixRegionStart,
+                        suffixContext,
+                        similarity
+                    );
+                }
             }
             final long centroidOrdinalAndScore = nextRaw.next();
             final int centroidOrdinal = neighborQueue.decodeNodeId(centroidOrdinalAndScore);
@@ -1001,6 +1041,36 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     private static final int REFINE_MIN = 64;
 
     private static final int REFINE_FRACTION = 10;
+
+    /**
+     * Chunk size for suffix refinement. {@code 1} (the default) keeps the one-at-a-time lazy path,
+     * which rewrites each refined score over the queue top with a single sift-down
+     * ({@link #refineQueueTopOnDemand}). A value {@code > 1} switches to chunked "bulk" refinement
+     * ({@link #refineQueueChunkOnDemand}): up to {@code chunk} top-unrefined centroids are popped,
+     * their suffix vectors are scored in one ordinal-sorted batch (sequential mmap reads, amortized
+     * per-call setup), and the combined scores are pushed back. Chunking trades the single-sift-down
+     * heap saving and the lazy consumer-awareness for I/O locality and setup amortization, which only
+     * pays off at high visit% where most refined centroids are consumed anyway; hence it stays off by
+     * default and is opt-in per query via {@code -Dorg.elasticsearch.diskbbq.refineChunk=N}.
+     *
+     * <p>Note: a reassembled {@code scoreBulk} over the chunk is deliberately <em>not</em> used. The
+     * SIMD Int7 scorer is only selected for memory-segment backed inputs, so copying the scattered
+     * per-vector suffix frames into a heap scratch buffer would silently fall back to the scalar
+     * scorer; batched per-vector {@code score()} on the real input preserves the SIMD dot product.
+     */
+    private static final int REFINE_CHUNK = readRefineChunk();
+
+    private static int readRefineChunk() {
+        final String prop = System.getProperty("org.elasticsearch.diskbbq.refineChunk");
+        if (prop == null) {
+            return 1;
+        }
+        try {
+            return Math.max(1, Integer.parseInt(prop));
+        } catch (NumberFormatException e) {
+            return 1;
+        }
+    }
 
     /**
      * Per-query bypass threshold for the suffix-refinement step. When the prefix-only scores of the
@@ -1034,8 +1104,13 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
      * combines prefix + suffix score, repeating until the top is already refined or the budget
      * is exhausted. Called before every {@code popRaw()} so the emitted score is either combined
      * or prefix-only if beyond the {@code max(REFINE_MIN, queueSize/REFINE_FRACTION)} cap.
+     *
+     * <p>Each refinement rewrites the refined score over the current top with a single
+     * {@link NeighborQueue#updateTop(int, float)} sift-down rather than a {@code popRaw()} +
+     * {@code add()} pair: the refined (combined) score never exceeds the prefix-only score it
+     * replaces, so the top can only stay put or sink, which is exactly what a sift-down handles.
      */
-    private static void refineQueueTopOnDemand(
+    static void refineQueueTopOnDemand(
         NeighborQueue neighborQueue,
         boolean[] refined,
         int[] remainingBudget,
@@ -1056,8 +1131,10 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             if (refined[topOrd]) {
                 return;
             }
-            final long raw = neighborQueue.popRaw();
-            final float prefixScore = neighborQueue.decodeScore(raw);
+            // Peek the prefix score rather than popping: the combined score is written back over the
+            // same top element with one sift-down (NeighborQueue#updateTop), halving the per-refine
+            // heap work compared with popRaw() + add().
+            final float prefixScore = neighborQueue.topScore();
             centroids.seek(suffixRegionStart + (long) topOrd * suffixStride);
             final float suffixScore = suffixContext.scorer()
                 .score(
@@ -1072,7 +1149,99 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             final float combined = PrefixSuffixScoreCombiner.combine(similarityFunction, prefixScore, suffixScore);
             refined[topOrd] = true;
             remainingBudget[0]--;
-            neighborQueue.add(topOrd, combined);
+            neighborQueue.updateTop(topOrd, combined);
+        }
+    }
+
+    /**
+     * Chunked ("bulk") variant of {@link #refineQueueTopOnDemand}, enabled by {@link #REFINE_CHUNK}.
+     * Instead of refining a single centroid per call, it pops up to {@code chunkSize} of the top
+     * unrefined centroids, scores their suffix vectors in one ordinal-sorted batch, and pushes the
+     * combined scores back. Two things are amortized over the chunk: the per-call scorer setup
+     * (query params / quantized query / centroid dot product), and disk access — sorting the chunk
+     * by ordinal turns prefix-score-order random seeks into front-to-back sequential reads of the
+     * per-vector suffix region, which is friendlier to the mmap page cache and read-ahead.
+     *
+     * <p>The suffix vectors are scored with per-vector {@code score()} calls on the real centroid
+     * input rather than a reassembled {@code scoreBulk}: the SIMD Int7 scorer is only chosen for
+     * memory-segment backed inputs, so gathering the scattered per-vector frames into a heap scratch
+     * buffer would drop to the scalar scorer and lose the SIMD dot product. Batched {@code score()}
+     * keeps the SIMD path while still amortizing setup and I/O.
+     *
+     * <p>The outer loop preserves the {@link #refineQueueTopOnDemand} contract: it keeps refining
+     * chunks until the queue top is already refined (so the next emit carries a combined score) or
+     * the budget is exhausted. Unlike the single-step path it cannot use the in-place sift-down,
+     * because the chunk members must leave the heap to be identified; each chunk therefore costs a
+     * pop + push per member, traded for the batched I/O and setup savings.
+     */
+    static void refineQueueChunkOnDemand(
+        NeighborQueue neighborQueue,
+        boolean[] refined,
+        int[] remainingBudget,
+        IndexInput centroids,
+        long suffixRegionStart,
+        ScoringContext suffixContext,
+        VectorSimilarityFunction similarityFunction,
+        int chunkSize,
+        int[] chunkOrds,
+        float[] chunkPrefix,
+        float[] chunkCombined
+    ) throws IOException {
+        if (suffixContext == null) {
+            return;
+        }
+        final long suffixStride = suffixContext.bytesPerVector();
+        final OptimizedScalarQuantizer.QuantizationResult queryParams = suffixContext.queryParams();
+        final byte[] quantizedQuery = suffixContext.quantizedQuery();
+        final float centroidDp = suffixContext.centroidDp();
+        while (remainingBudget[0] > 0 && neighborQueue.size() > 0 && refined[neighborQueue.topNode()] == false) {
+            // Pop the chunk: up to min(chunkSize, budget) of the current top-unrefined centroids.
+            // Stop early if an already-refined centroid surfaces (it stays in the queue for emit).
+            final int target = Math.min(chunkSize, remainingBudget[0]);
+            int chunkCount = 0;
+            while (chunkCount < target && neighborQueue.size() > 0) {
+                final int topOrd = neighborQueue.topNode();
+                if (refined[topOrd]) {
+                    break;
+                }
+                final long raw = neighborQueue.popRaw();
+                chunkOrds[chunkCount] = topOrd;
+                chunkPrefix[chunkCount] = neighborQueue.decodeScore(raw);
+                refined[topOrd] = true;
+                chunkCount++;
+            }
+            // Sort the chunk by ordinal (insertion sort; chunks are small) so the suffix region is
+            // read front-to-back instead of in prefix-score order.
+            for (int a = 1; a < chunkCount; a++) {
+                final int ord = chunkOrds[a];
+                final float pre = chunkPrefix[a];
+                int b = a - 1;
+                while (b >= 0 && chunkOrds[b] > ord) {
+                    chunkOrds[b + 1] = chunkOrds[b];
+                    chunkPrefix[b + 1] = chunkPrefix[b];
+                    b--;
+                }
+                chunkOrds[b + 1] = ord;
+                chunkPrefix[b + 1] = pre;
+            }
+            for (int j = 0; j < chunkCount; j++) {
+                centroids.seek(suffixRegionStart + (long) chunkOrds[j] * suffixStride);
+                final float suffixScore = suffixContext.scorer()
+                    .score(
+                        quantizedQuery,
+                        queryParams.lowerInterval(),
+                        queryParams.upperInterval(),
+                        queryParams.quantizedComponentSum(),
+                        queryParams.additionalCorrection(),
+                        similarityFunction,
+                        centroidDp
+                    );
+                chunkCombined[j] = PrefixSuffixScoreCombiner.combine(similarityFunction, chunkPrefix[j], suffixScore);
+            }
+            remainingBudget[0] -= chunkCount;
+            for (int j = 0; j < chunkCount; j++) {
+                neighborQueue.add(chunkOrds[j], chunkCombined[j]);
+            }
         }
     }
 
