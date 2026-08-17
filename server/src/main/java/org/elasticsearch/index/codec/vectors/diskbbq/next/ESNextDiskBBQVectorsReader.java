@@ -16,10 +16,12 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.ConjunctionUtils;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.packed.DirectReader;
 import org.apache.lucene.util.packed.DirectWriter;
@@ -33,6 +35,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.DocIdsWriter;
 import org.elasticsearch.index.codec.vectors.diskbbq.FlatCentroidIndex;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfAutoCalibration;
+import org.elasticsearch.index.codec.vectors.diskbbq.MatchFetchIndex;
 import org.elasticsearch.index.codec.vectors.diskbbq.PostingMetadata;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
@@ -44,7 +47,11 @@ import org.elasticsearch.simdvec.ES940OSQVectorsScorer;
 import org.elasticsearch.simdvec.ESVectorUtil;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
@@ -76,6 +83,77 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             ESNextDiskBBQVectorsFormat.DYNAMIC_VISIT_RATIO
         );
     }
+
+    /**
+     * Maximum matches scored per cluster visit, as a multiple of {@code k}; 0 drains each cluster.
+     * See the use site for why breadth can beat depth under a tight budget.
+     */
+    private static final int FETCH_PER_CLUSTER_CAP_K = Integer.parseInt(System.getProperty("es.poc.fetch.capK", "0"));
+
+    /**
+     * How the fetch path spends its visit allowance. All three are charged in the same unit the
+     * scan-based gates use -- posting-list entries -- so the number is comparable across arms.
+     *
+     * <p>MATCHES charges only the documents that pass the filter. Non-matching entries are free,
+     * which is what the fetch mechanics actually deliver, but it means the arm does far more work
+     * than a scan given the same allowance and so cannot be compared against one at equal settings.
+     *
+     * <p>ENTRIES charges every entry of every cluster opened, matching or not. This is exactly the
+     * scan's rule, so both arms stop after covering the same amount of posting data -- but it hands
+     * back none of the savings from skipping non-matches, which is the fetch path's whole point.
+     *
+     * <p>BLOCKS charges the entries of each 32-document block the fetch actually reads, and nothing
+     * for blocks it skips entirely. Both paths read posting data in 32-document blocks, and a scan
+     * reads every block of every cluster it opens, so for the scan BLOCKS and ENTRIES are the same
+     * number: its budget is untouched. For the fetch they diverge exactly by the blocks it managed
+     * to skip. That makes it the honest middle ground. Where the filter is dense the fetch skips
+     * nothing, is charged the full cluster, and stops where the scan stops. Where the filter is
+     * sparse it skips most of each cluster and earns proportionally more clusters for the same
+     * bytes read. The compensation for selective filters is earned in proportion to work genuinely
+     * avoided, rather than granted by a separate hand-tuned phase as the scan does.
+     */
+    private enum BudgetMode {
+        MATCHES,
+        ENTRIES,
+        BLOCKS
+    }
+
+    /**
+     * Per-thread set of documents already scored this query, so each is scored exactly once however
+     * many clusters store a copy of it.
+     *
+     * <p>The scan has no such set: it scores every copy it meets and collects each one, so a
+     * SOAR-overspilled document can take two slots in the collector. That is why a k=10 search can
+     * come back with 8 distinct documents. Scoring once is both cheaper and strictly better formed.
+     *
+     * <p>Which copy gets scored is then whichever cluster is visited first, and the two do not score
+     * alike -- one document's copies estimated 0.374 and 0.295 on a merged segment, because k-means
+     * puts a vector in the cluster that minimizes its residual, making the owning cluster's copy the
+     * better-quantized one. Preferring the owning copy was tried and is worse overall: it means
+     * scoring a document again when its owning cluster turns up later, which reintroduces exactly
+     * the duplicate collector entries this set exists to remove.
+     */
+    private static final ThreadLocal<FixedBitSet> VISITED_SCRATCH = new ThreadLocal<>();
+
+    /** Every copy after the first is redundant: the same vector, already scored this query. */
+    private static boolean worthScoring(MatchFetchIndex.MatchView view, int at, FixedBitSet visited) {
+        return visited.get(view.docs()[at]) == false;
+    }
+
+    private static FixedBitSet visitedScratch(int maxDoc) {
+        FixedBitSet set = VISITED_SCRATCH.get();
+        if (set == null || set.length() < maxDoc) {
+            set = new FixedBitSet(maxDoc);
+            VISITED_SCRATCH.set(set);
+        } else {
+            set.clear();
+        }
+        return set;
+    }
+
+    private static final BudgetMode FETCH_BUDGET_MODE = BudgetMode.valueOf(
+        System.getProperty("es.poc.fetch.budget", "matches").toUpperCase(Locale.ROOT)
+    );
 
     CentroidIterator getPostingListPrefetchIterator(CentroidIterator centroidIterator, IndexInput postingListSlice) throws IOException {
         // TODO we may want to prefetch more than one postings list, however, we will likely want to place a limit
@@ -125,6 +203,12 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
     public QuantEncoding getQuantEncoding(FieldInfo fieldInfo) {
         final NextFieldEntry e = fields.get(fieldInfo.number);
         return e == null ? null : e.quantEncoding();
+    }
+
+    // visible for testing
+    NextFieldEntry fieldEntry(String fieldName) {
+        final FieldInfo info = fieldInfos.fieldInfo(fieldName);
+        return info == null ? null : fields.get(info.number);
     }
 
     @Override
@@ -271,6 +355,346 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         }
     }
 
+    /**
+     * FetchGate (POC): scores the filter's matching documents by fetching their quantized bytes
+     * directly out of the posting lists, in centroid-distance order, with the visit budget counted
+     * in matches scored. See {@link MatchFetchIndex} for the structures and the rationale. Declines
+     * (returns {@code false}) on layouts the geometry does not model — sliced segments, non-flat
+     * centroid indexes — and when the filter exposes no random-access bits; the caller then runs
+     * the standard gated search.
+     */
+    @Override
+    protected boolean fetchSearch(
+        FieldInfo fieldInfo,
+        NextFieldEntry entry,
+        FloatVectorValues values,
+        float[] target,
+        AcceptDocs acceptDocs,
+        KnnCollector knnCollector,
+        float visitRatio,
+        int numVectors
+    ) throws IOException {
+        if (entry.numSlices != -1 || entry.centroidIndexFormat() != CentroidIndexFormat.FLAT || entry.numCentroids() <= 1) {
+            return false;
+        }
+        final Bits bits = acceptDocs.bits();
+        if (bits == null) {
+            return false;
+        }
+        final int numCentroids = entry.numCentroids();
+        MatchFetchIndex fetchIndex = entry.matchFetchIndex();
+        if (fetchIndex == null) {
+            synchronized (entry) {
+                fetchIndex = entry.matchFetchIndex();
+                if (fetchIndex == null) {
+                    fetchIndex = buildMatchFetchIndex(fieldInfo, entry, values);
+                    entry.matchFetchIndex(fetchIndex);
+                    if (fetchIndex != MatchFetchIndex.UNSUPPORTED) {
+                        FlatCentroidIndex.POC_GATE_RAM_BYTES.addAndGet(fetchIndex.ramBytesUsed());
+                    }
+                }
+            }
+        }
+        if (fetchIndex == MatchFetchIndex.UNSUPPORTED) {
+            return false;
+        }
+        // Per-filter match view, memoized with the same content-verified fingerprint discipline as
+        // the counted gate's counts cache; a miss pays one O(matches) walk — small by definition in
+        // the selective regime where this path fires.
+        MatchFetchIndex.MatchView view = null;
+        // Key the match-view cache off the query's value set when one is available, exactly as
+        // Mariano's gate does. The content fingerprint below has to hash the filter bitset's words
+        // on every query (~1,563 words for a 100k-doc segment) purely to find a cache entry — work
+        // the scan-based gate never performs, and enough to account for the last few percent of
+        // throughput on a mid-selectivity workload. A value set identifies the filter exactly, so
+        // no verification pass is needed either.
+        final int[] cacheValueSet = FlatCentroidIndex.POC_QUERY_VALUE_SET.get();
+        final Long fingerprint = cacheValueSet != null && cacheValueSet.length > 0
+            ? (long) Arrays.hashCode(cacheValueSet) ^ 0x5DEECE66DL
+            : FlatCentroidIndex.filterFingerprint(bits, acceptDocs);
+        if (fingerprint != null) {
+            final FieldEntry.CachedMatchView cached = entry.matchViewCache().get(fingerprint);
+            if (cached != null && (cacheValueSet != null || FlatCentroidIndex.sameFilter(cached.source().get(), bits))) {
+                view = cached.view();
+            }
+        }
+        if (view == null) {
+            final KnnVectorValues.DocIndexIterator docIndexIterator = values.iterator();
+            final DocIdSetIterator matching = ConjunctionUtils.intersectIterators(List.of(acceptDocs.iterator(), docIndexIterator));
+            final IndexInput centroidSlice = entry.centroidSlice(ivfCentroids);
+            final int bitsRequired = DirectWriter.bitsRequired(numCentroids);
+            final long sizeLookup = DirectWriter.bytesRequired(values.size(), bitsRequired);
+            final LongValues centroidOfOrdinal = DirectReader.getInstance(centroidSlice.randomAccessSlice(0, sizeLookup), bitsRequired);
+            view = MatchFetchIndex.MatchView.build(
+                matching,
+                docIndexIterator,
+                centroidOfOrdinal,
+                fetchIndex,
+                numCentroids,
+                Math.max(0, acceptDocs.cost())
+            );
+            if (fingerprint != null) {
+                if (entry.matchViewCache().put(fingerprint, new FieldEntry.CachedMatchView(new WeakReference<>(bits), view)) == null) {
+                    FlatCentroidIndex.POC_GATE_RAM_BYTES.addAndGet(FieldEntry.CACHE_ENTRY_OVERHEAD + view.ramBytesUsed());
+                }
+            }
+        }
+        if (view.totalMatches() == 0) {
+            // no matching document carries a vector: the empty result is the correct result
+            return true;
+        }
+        runFetch(fieldInfo, entry, values, target, acceptDocs, knnCollector, visitRatio, numVectors, fetchIndex, view);
+        return true;
+    }
+
+    private void runFetch(
+        FieldInfo fieldInfo,
+        NextFieldEntry entry,
+        FloatVectorValues values,
+        float[] target,
+        AcceptDocs acceptDocs,
+        KnnCollector knnCollector,
+        float visitRatio,
+        int numVectors,
+        MatchFetchIndex fetchIndex,
+        MatchFetchIndex.MatchView view
+    ) throws IOException {
+        // The budget is counted in matches scored — the only per-document work this path performs.
+        // The 2x mirrors maxVectorsToVisit's SOAR allowance: the scan's cap is 2 * ratio * N posting
+        // entries where a document can appear twice, and in dense match regions (filter aligned with
+        // the query) nearly every entry it visits is a match. Scoring each document exactly once,
+        // the fetch needs the same doubled cap to see as many distinct matches as the scan does.
+        final long matchBudget = Math.max(knnCollector.k(), (long) Math.ceil(2.0 * visitRatio * numVectors));
+        final BudgetMode budgetMode = FETCH_BUDGET_MODE;
+        // 0 disables the cap and drains each cluster fully (the original depth-first behaviour)
+        final int perClusterCap = FETCH_PER_CLUSTER_CAP_K > 0 ? FETCH_PER_CLUSTER_CAP_K * knnCollector.k() : 0;
+        final QuantEncoding quantEncoding = entry.quantEncoding();
+        final VectorSimilarityFunction similarityFunction = fieldInfo.getVectorSimilarityFunction();
+        final long quantizedVectorByteSize = quantEncoding.getDocPackedLength(fieldInfo.getVectorDimension());
+
+        // Distance-ordered iterator over exactly the posting lists that hold >= 1 match: the accept
+        // set is handed to the centroid index precomputed (it falls out of the match view), so the
+        // ordering machinery is identical to the gated scan's.
+        final CentroidIterator centroidIterator;
+        FlatCentroidIndex.POC_FETCH_ACCEPT_CENTROIDS.set(view.acceptCentroids());
+        try {
+            centroidIterator = new FlatCentroidIndex(
+                fieldInfo,
+                entry,
+                entry.numCentroids(),
+                entry.centroidSlice(ivfCentroids),
+                target,
+                acceptDocs,
+                view.totalMatches(),
+                values,
+                visitRatio
+            ).getIterator();
+        } finally {
+            FlatCentroidIndex.POC_FETCH_ACCEPT_CENTROIDS.remove();
+        }
+
+        // query quantization per query-centroid ordinal, exactly as the posting visitor does
+        final IndexInput centroidSlice = entry.centroidSlice(ivfCentroids);
+        final int bitsRequired = DirectWriter.bitsRequired(entry.numCentroids());
+        centroidSlice.skipBytes(DirectWriter.bytesRequired(values.size(), bitsRequired));
+        final int numParents = centroidSlice.readVInt();
+        final QueryQuantizer queryQuantizer;
+        if (numParents > 0) {
+            centroidSlice.readVInt(); // longest posting list, unused
+            final IndexInput parentsSlice = centroidSlice.slice(
+                "parents-slice",
+                centroidSlice.getFilePointer(),
+                (long) numParents * fieldInfo.getVectorDimension() * Float.BYTES
+            );
+            queryQuantizer = new QueryQuantizer(quantEncoding, fieldInfo, target, parentsSlice, entry.globalCentroid());
+        } else {
+            queryQuantizer = new QueryQuantizer(quantEncoding, fieldInfo, target, null, entry.globalCentroid());
+        }
+
+        final IndexInput postingSlice = entry.postingListSlice(ivfClusters);
+        final ES940OSQVectorsScorer scorer = ESVectorUtil.getES940OSQVectorsScorer(
+            postingSlice,
+            quantEncoding.queryBits(),
+            quantEncoding.bits(),
+            fieldInfo.getVectorDimension(),
+            (int) quantizedVectorByteSize,
+            BULK_SIZE,
+            quantEncoding.bits() == 2 || quantEncoding.bits() == 4
+                ? ES940OSQVectorsScorer.BitEncoding.PACKED
+                : ES940OSQVectorsScorer.BitEncoding.STRIPED
+        );
+        final float[] scoreScratch = new float[BULK_SIZE];
+        final int[] slotScratch = new int[BULK_SIZE];
+
+        final FixedBitSet visited = visitedScratch(fetchIndex.maxDoc());
+        long scored = 0;
+        long budgetSpent = 0;
+        while (centroidIterator.hasNext()
+            && (budgetSpent < matchBudget || knnCollector.minCompetitiveSimilarity() == Float.NEGATIVE_INFINITY)) {
+            final PostingMetadata metadata = centroidIterator.nextPosting();
+            final int centroid = fetchIndex.centroidForOffset(metadata.offset());
+            assert centroid >= 0 : "posting offset not in fetch geometry";
+            final int from = view.csrOffsets()[centroid];
+            int to = view.csrOffsets()[centroid + 1];
+            if (from == to) {
+                continue;
+            }
+            // Breadth-first budget: a cluster holding hundreds of matches would otherwise drain the
+            // whole budget before the next-nearest cluster is opened at all, even though a cluster
+            // with a single match may well hold the nearest neighbour. Capping how many of a
+            // cluster's matches are scored in one visit spreads the budget over more of the
+            // distance-ordered clusters. The cap is a multiple of k because k sets how many results
+            // any one cluster could plausibly contribute.
+            if (perClusterCap > 0 && to - from > perClusterCap) {
+                to = from + perClusterCap;
+            }
+            postingSlice.seek(metadata.offset());
+            final float centroidToParentSqDist = Float.intBitsToFloat(postingSlice.readInt());
+            final int postingEntries = postingSlice.readVInt();
+            if (budgetMode == BudgetMode.ENTRIES) {
+                budgetSpent += postingEntries;
+            }
+            final float rawScore = metadata.documentCentroidScore();
+            // identical raw-similarity reconstruction to the posting visitor's resetPostingsScorer
+            final float centroidDistance = switch (similarityFunction) {
+                case EUCLIDEAN -> ((1 / rawScore) - 1) - centroidToParentSqDist;
+                case COSINE, DOT_PRODUCT -> 2 * rawScore - 1;
+                case MAXIMUM_INNER_PRODUCT -> rawScore - 1;
+            };
+            queryQuantizer.reset(metadata.queryCentroidOrdinal());
+            queryQuantizer.quantizeQueryIfNecessary();
+            final OptimizedScalarQuantizer.QuantizationResult queryCorrections = queryQuantizer.getQueryCorrections();
+            final byte[] quantizedTarget = queryQuantizer.getQuantizedTarget();
+            // Matches within a cluster are in posting order, so same-block matches are consecutive.
+            // Score a whole block in one call: quantizeScoreBulkOffsets walks the block once,
+            // skipping unselected vectors with skipBytes rather than reading them, and the four
+            // correction columns are read sequentially in bulk. That replaces the previous five
+            // scattered seeks per matching document with a single seek per block, which is where
+            // the scan-based gates were winning on throughput despite scoring far more documents.
+            int i = from;
+            int clusterScored = 0;
+            while (i < to) {
+                final int firstDoc = view.docs()[i];
+                assert fetchIndex.hasDoc(firstDoc) : "match view names a doc the fetch geometry does not know";
+                final long blockPtr = fetchIndex.blockOffset(firstDoc, view.occurrence()[i]);
+                final int count = fetchIndex.blockCount(firstDoc, view.occurrence()[i]);
+                int end = i + 1;
+                while (end < to && fetchIndex.blockOffset(view.docs()[end], view.occurrence()[end]) == blockPtr) {
+                    end++;
+                }
+                // Score the block's matching slots. quantizeScoreBulkOffsets scores each selected
+                // document with the scalar kernel but SKIPS the rest with skipBytes rather than
+                // reading them, and pulls the four correction columns sequentially. Scoring the
+                // whole block with the SIMD kernel instead was measured 1.8x SLOWER here: at one or
+                // two matches per block the 8 KB of vector bytes it must read dominates the cheaper
+                // arithmetic. Memory traffic, not the popcount, is the binding cost.
+                int numSlots = 0;
+                for (int j = i; j < end; j++) {
+                    if (worthScoring(view, j, visited)) {
+                        // ascending by construction: doc order within a block is slot order
+                        slotScratch[numSlots++] = fetchIndex.slot(view.docs()[j], view.occurrence()[j]);
+                    }
+                }
+                if (numSlots == 0) {
+                    i = end;
+                    continue;
+                }
+                if (budgetMode == BudgetMode.BLOCKS) {
+                    // charged for the whole block: reading one match in it pulls all of its bytes
+                    budgetSpent += count;
+                }
+                postingSlice.seek(blockPtr);
+                final float maxScore = scorer.scoreBulkOffsets(
+                    quantizedTarget,
+                    queryCorrections.lowerInterval(),
+                    queryCorrections.upperInterval(),
+                    queryCorrections.quantizedComponentSum(),
+                    centroidDistance,
+                    similarityFunction,
+                    0f,
+                    slotScratch,
+                    numSlots,
+                    scoreScratch,
+                    count
+                );
+                final boolean competitive = knnCollector.minCompetitiveSimilarity() < maxScore;
+                for (int j = i; j < end; j++) {
+                    if (worthScoring(view, j, visited) == false) {
+                        continue;
+                    }
+                    final int doc = view.docs()[j];
+                    if (competitive) {
+                        knnCollector.collect(doc, scoreScratch[fetchIndex.slot(doc, view.occurrence()[j])]);
+                    }
+                    visited.set(doc);
+                    clusterScored++;
+                }
+                i = end;
+            }
+            scored += clusterScored;
+            if (budgetMode == BudgetMode.MATCHES) {
+                budgetSpent += clusterScored;
+            }
+            knnCollector.incVisitedCount(clusterScored);
+            if (knnCollector.getSearchStrategy() != null) {
+                knnCollector.getSearchStrategy().nextVectorsBlock();
+            }
+        }
+    }
+
+    @Override
+    protected MatchFetchIndex matchFetchGeometry(FieldInfo fieldInfo, NextFieldEntry entry, FloatVectorValues values) throws IOException {
+        MatchFetchIndex geometry = entry.matchFetchIndex();
+        if (geometry == null) {
+            synchronized (entry) {
+                geometry = entry.matchFetchIndex();
+                if (geometry == null) {
+                    geometry = buildMatchFetchIndex(fieldInfo, entry, values);
+                    entry.matchFetchIndex(geometry);
+                    // charged here as well as on the fetch path: the lens needs this geometry to
+                    // know each document's SOAR overspill cluster, so when the lens builds it first
+                    // the heap belongs to the lens and must not go unreported
+                    if (geometry != MatchFetchIndex.UNSUPPORTED) {
+                        FlatCentroidIndex.POC_GATE_RAM_BYTES.addAndGet(geometry.ramBytesUsed());
+                    }
+                }
+            }
+        }
+        return geometry == MatchFetchIndex.UNSUPPORTED ? null : geometry;
+    }
+
+    private MatchFetchIndex buildMatchFetchIndex(FieldInfo fieldInfo, NextFieldEntry entry, FloatVectorValues values) throws IOException {
+        final int numCentroids = entry.numCentroids();
+        // ordinals are in doc order, so the last ordinal's doc bounds the posting lists' doc space
+        final int maxDoc = values.ordToDoc(values.size() - 1) + 1;
+        final int[] docToOrdinal = new int[maxDoc];
+        Arrays.fill(docToOrdinal, -1);
+        final KnnVectorValues.DocIndexIterator it = values.iterator();
+        for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+            docToOrdinal[doc] = it.index();
+        }
+        final IndexInput centroidSlice = entry.centroidSlice(ivfCentroids);
+        final int bitsRequired = DirectWriter.bitsRequired(numCentroids);
+        final long sizeLookup = DirectWriter.bytesRequired(values.size(), bitsRequired);
+        final LongValues centroidOfOrdinal = DirectReader.getInstance(centroidSlice.randomAccessSlice(0, sizeLookup), bitsRequired);
+        final long[] postingOffsets = readPostingListOffsets(
+            entry.centroidSlice(ivfCentroids),
+            values.size(),
+            numCentroids,
+            fieldInfo.getVectorDimension()
+        );
+        final MatchFetchIndex built = MatchFetchIndex.build(
+            entry.postingListSlice(ivfClusters),
+            postingOffsets,
+            centroidOfOrdinal,
+            docToOrdinal,
+            maxDoc,
+            BULK_SIZE,
+            entry.quantEncoding().getDocPackedLength(fieldInfo.getVectorDimension())
+        );
+        return built == null ? MatchFetchIndex.UNSUPPORTED : built;
+    }
+
     private static long[] readPostingListOffsets(IndexInput centroidSlice, int numVectors, int numCentroids, int dimension)
         throws IOException {
         long[] offsets = new long[numCentroids];
@@ -373,6 +797,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         public int numSlices() {
             return numSlices;
         }
+
     }
 
     @Override
@@ -646,6 +1071,12 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         float centroidToParentSqDist;
         float centroidDistance;
         long slicePos;
+        /**
+         * How many documents in this posting list carry the query's attribute, or -1 when unknown.
+         * Once that many have been scored the rest of the list provably holds no further match, so
+         * scanning it is pure waste — this is the count the cluster value-set summary already has,
+         * used to cut the tail of every cluster short.
+         */
 
         private final QueryQuantizer queryQuantizer;
         final DocIdsWriter idsWriter = new DocIdsWriter();
