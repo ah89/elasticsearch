@@ -1,7 +1,5 @@
 config:
   trigger-phrase: '.*run\W+elasticsearch-ci/bwc.*'
-  skip-target-branches:
-    - "patch/serverless-fix"
   skip-labels:
     - ">test-mute"
     - "test-full-bwc"
