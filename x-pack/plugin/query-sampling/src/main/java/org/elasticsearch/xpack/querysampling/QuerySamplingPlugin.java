@@ -13,6 +13,7 @@ import org.elasticsearch.action.search.SearchLogContext;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.internal.OriginSettingClient;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.common.Randomness;
 import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.logging.activity.ActivityLogListener;
@@ -22,18 +23,31 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.FeatureFlag;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.features.NodeFeature;
 import org.elasticsearch.index.reindex.DeleteByQueryAction;
 import org.elasticsearch.indices.SystemIndexDescriptor;
 import org.elasticsearch.plugins.ActionPlugin;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.SystemIndexPlugin;
+import org.elasticsearch.rest.RestHandler;
 import org.elasticsearch.threadpool.ExecutorBuilder;
 import org.elasticsearch.threadpool.FixedExecutorBuilder;
+import org.elasticsearch.xpack.querysampling.action.QuerySamplingActions;
+import org.elasticsearch.xpack.querysampling.action.TransportQuerySamplingGoldenCheckAction;
+import org.elasticsearch.xpack.querysampling.action.TransportQuerySamplingGoldenUpdateAction;
+import org.elasticsearch.xpack.querysampling.action.TransportQuerySamplingGroundTruthAction;
+import org.elasticsearch.xpack.querysampling.action.TransportQuerySamplingRecallAction;
+import org.elasticsearch.xpack.querysampling.action.TransportQuerySamplingStatsAction;
 import org.elasticsearch.xpack.querysampling.capture.CaptureHandoff;
 import org.elasticsearch.xpack.querysampling.capture.QueryCaptureListener;
 import org.elasticsearch.xpack.querysampling.dedup.MultiplicityTracker;
 import org.elasticsearch.xpack.querysampling.groundtruth.CostBudget;
 import org.elasticsearch.xpack.querysampling.groundtruth.GroundTruthWorker;
+import org.elasticsearch.xpack.querysampling.rest.RestQuerySamplingGoldenCheckAction;
+import org.elasticsearch.xpack.querysampling.rest.RestQuerySamplingGoldenUpdateAction;
+import org.elasticsearch.xpack.querysampling.rest.RestQuerySamplingGroundTruthAction;
+import org.elasticsearch.xpack.querysampling.rest.RestQuerySamplingRecallAction;
+import org.elasticsearch.xpack.querysampling.rest.RestQuerySamplingStatsAction;
 import org.elasticsearch.xpack.querysampling.sampling.EventSlice;
 import org.elasticsearch.xpack.querysampling.sampling.PickBudget;
 import org.elasticsearch.xpack.querysampling.sampling.QuerySampler;
@@ -56,6 +70,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 import static org.elasticsearch.xpack.core.ClientHelper.QUERY_SAMPLING_ORIGIN;
 
@@ -191,8 +207,60 @@ public class QuerySamplingPlugin extends Plugin implements ActionPlugin, SystemI
         );
         groundTruthWorker.start(services.threadPool(), generic, clusterSettings);
         CaptureHandoff handoff = new CaptureHandoff(services.threadPool().executor(THREAD_POOL_NAME), pipeline);
-        captureListener.set(new QueryCaptureListener(clusterSettings, handoff, services.threadPool()::relativeTimeInMillis));
-        return List.of();
+        QueryCaptureListener capture = new QueryCaptureListener(clusterSettings, handoff, services.threadPool()::relativeTimeInMillis);
+        captureListener.set(capture);
+        return List.of(
+            new QuerySamplingStatsSource(
+                () -> new QuerySamplingStats(
+                    capture.knnSearches(),
+                    capture.captured(),
+                    handoff.dropped(),
+                    tracker.distinct(),
+                    tracker.untracked(),
+                    pipeline.picked(),
+                    writer.written(),
+                    writer.failed(),
+                    writer.dropped(),
+                    refresher.refreshed(),
+                    retention.deleted(),
+                    groundTruthWorker.computed(),
+                    groundTruthWorker.failed(),
+                    pipeline.starved(),
+                    capture.effectiveCaptureRate(),
+                    pipeline.acceptanceScale(),
+                    budget.credit()
+                )
+            )
+        );
+    }
+
+    @Override
+    public List<ActionHandler> getActions() {
+        return List.of(
+            new ActionHandler(QuerySamplingActions.STATS, TransportQuerySamplingStatsAction.class),
+            new ActionHandler(QuerySamplingActions.GROUND_TRUTH, TransportQuerySamplingGroundTruthAction.class),
+            new ActionHandler(QuerySamplingActions.RECALL, TransportQuerySamplingRecallAction.class),
+            new ActionHandler(QuerySamplingActions.GOLDEN_UPDATE, TransportQuerySamplingGoldenUpdateAction.class),
+            new ActionHandler(QuerySamplingActions.GOLDEN_CHECK, TransportQuerySamplingGoldenCheckAction.class)
+        );
+    }
+
+    @Override
+    public List<RestHandler> getRestHandlers(
+        RestHandlersServices restHandlersServices,
+        Supplier<DiscoveryNodes> nodesInCluster,
+        Predicate<NodeFeature> clusterSupportsFeature
+    ) {
+        if (QUERY_SAMPLING_FEATURE_FLAG.isEnabled() == false) {
+            return List.of();
+        }
+        return List.of(
+            new RestQuerySamplingStatsAction(),
+            new RestQuerySamplingGroundTruthAction(),
+            new RestQuerySamplingRecallAction(),
+            new RestQuerySamplingGoldenUpdateAction(),
+            new RestQuerySamplingGoldenCheckAction()
+        );
     }
 
     @Override
