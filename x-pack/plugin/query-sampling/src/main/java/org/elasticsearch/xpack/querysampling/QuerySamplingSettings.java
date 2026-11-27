@@ -72,9 +72,43 @@ public final class QuerySamplingSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Number of clusters of query vectors per field used to balance the sample, see {@link #SPATIAL_BALANCE}. 0
+     * disables. The default, 16, is what the offline replay of the sampler used. Built per node, in memory: before the
+     * clusters are fitted, ten vectors per cluster wait for it, for each field, which is why the number is limited.
+     */
+    public static final Setting<Integer> SPATIAL_CLUSTERS = Setting.intSetting(
+        "xpack.query_sampling.spatial_clusters",
+        16,
+        0,
+        64,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * 0 follows the traffic, 1 (the default) picks as many queries from each cluster. No effect without {@link
+     * #SPATIAL_CLUSTERS}.
+     */
+    public static final Setting<Double> SPATIAL_BALANCE = Setting.doubleSetting(
+        "xpack.query_sampling.spatial_balance",
+        1.0,
+        0.0,
+        1.0,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     private QuerySamplingSettings() {}
 
     public static List<Setting<?>> getSettings() {
-        return List.of(ENABLED, CAPTURE_RATE, MIN_CAPTURES_PER_HOUR, MAX_PICKS_PER_HOUR, TARGET_PICKS_PER_HOUR);
+        return List.of(
+            ENABLED,
+            CAPTURE_RATE,
+            MIN_CAPTURES_PER_HOUR,
+            MAX_PICKS_PER_HOUR,
+            TARGET_PICKS_PER_HOUR,
+            SPATIAL_CLUSTERS,
+            SPATIAL_BALANCE
+        );
     }
 }

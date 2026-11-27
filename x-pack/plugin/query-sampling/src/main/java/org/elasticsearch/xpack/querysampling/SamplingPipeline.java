@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 
 /**
- * Processes captured searches off the search thread: dedup, sampling decision, listeners. The tracker and the sampler keep
+ * Processes captured searches off the search thread: dedup, sampling decision, listeners. The tracker and the strata keep
  * state that is not made for several threads. The pool that runs this has one thread, and the lock keeps one search at a
  * time even if someone gives the pool more; it is not contended, as nothing else calls it.
  */
@@ -56,6 +56,12 @@ public final class SamplingPipeline implements Consumer<CapturedSearch> {
     public synchronized void accept(CapturedSearch captured) {
         QueryFingerprint fingerprint = QueryFingerprint.of(captured.query());
         TrackedQuery tracked = tracker.record(fingerprint, captured.captureRate());
+        // A search that found nothing says nothing of the data, its field may not even exist, and every field makes a space. So the
+        // stratum is given on the first capture that has hits, which is not always the first capture.
+        if (tracked != null && tracked.isPlaced() == false && captured.hits().isEmpty() == false) {
+            tracked.markPlaced();
+            sampler.assignStratum(tracked, captured.query().field(), captured.query().queryVector());
+        }
         if (tracked != null && sampler.offer(tracked)) {
             picked.increment();
             tell(new SampledQuery(fingerprint, captured, tracked));

@@ -25,7 +25,7 @@ import java.util.function.Supplier;
  * depend on it, and the first captured arrival is accepted with {@code γ·ln(1 + weight)}, capped at 1. Head queries,
  * captured at least the head threshold times, are always accepted so estimates do not swing on one coin flip; captures
  * are counted rather than estimated searches, since one capture stands for many searches and would make any captured
- * query look popular. γ is adjusted by
+ * query look popular. Picks are tilted by {@link SpatialStrata}, and γ is adjusted by
  * {@link ScaleRegulator}.
  */
 public final class QuerySampler {
@@ -39,6 +39,7 @@ public final class QuerySampler {
     private final long headThreshold;
     private final Supplier<Random> random;
     private final PickBudget budget;
+    private final SpatialStrata spatial;
     private final LongAdder starved = new LongAdder();
     private final ScaleRegulator regulator = new ScaleRegulator();
     private final LongSupplier nanoTime;
@@ -48,13 +49,21 @@ public final class QuerySampler {
      * @param scale         γ, the probability scale
      * @param headThreshold captured arrivals from which a query is always picked
      */
-    public QuerySampler(double scale, long headThreshold, Supplier<Random> random, PickBudget budget) {
-        this(scale, headThreshold, random, budget, System::nanoTime);
+    public QuerySampler(double scale, long headThreshold, Supplier<Random> random, PickBudget budget, SpatialStrata spatial) {
+        this(scale, headThreshold, random, budget, spatial, System::nanoTime);
     }
 
-    QuerySampler(double scale, long headThreshold, Supplier<Random> random, PickBudget budget, LongSupplier nanoTime) {
+    QuerySampler(
+        double scale,
+        long headThreshold,
+        Supplier<Random> random,
+        PickBudget budget,
+        SpatialStrata spatial,
+        LongSupplier nanoTime
+    ) {
         this.nanoTime = nanoTime;
         this.lastRegulation = nanoTime.getAsLong();
+        this.spatial = spatial;
         this.scale = scale;
         this.headThreshold = headThreshold;
         this.random = random;
@@ -64,6 +73,7 @@ public final class QuerySampler {
     public void watch(ClusterSettings clusterSettings) {
         clusterSettings.initializeAndWatch(QuerySamplingSettings.MAX_PICKS_PER_HOUR, budget::perHour);
         clusterSettings.initializeAndWatch(QuerySamplingSettings.TARGET_PICKS_PER_HOUR, regulator::targetPerHour);
+        spatial.watch(clusterSettings);
     }
 
     // Brings γ up to date with the pick rate once ten seconds have passed. The arrivals do it, as they are what makes the picks, so
@@ -86,9 +96,16 @@ public final class QuerySampler {
         return scale * regulator.adjustment();
     }
 
-    /** The chance of a pick before it is capped at 1. */
+    /**
+     * Uncapped on purpose: strata factors are applied before capping, otherwise a raised γ could not reach its target
+     * for queries in crowded clusters.
+     */
     private double uncappedAcceptance(double multiplicity, double weight) {
         return effectiveScale() * Math.log1p(weight / (1.0 + multiplicity - weight));
+    }
+
+    public void assignStratum(TrackedQuery query, String field, float[] vector) {
+        spatial.assign(field, vector, stratum -> query.stratum(stratum));
     }
 
     /**
@@ -105,7 +122,8 @@ public final class QuerySampler {
         boolean head = weights.multiplicity() >= headThreshold;
         double probability = 1.0;
         if (head == false) {
-            probability = Math.min(1.0, uncappedAcceptance(multiplicity, 1.0 / weights.captureRate()));
+            double strata = spatial.factor(query.stratum());
+            probability = Math.min(1.0, uncappedAcceptance(multiplicity, 1.0 / weights.captureRate()) * strata);
         }
         if (head == false && budget.available() == false) {
             // limit reached: the chance is cut, not taken away, so every query keeps one and estimates stay unbiased; a few

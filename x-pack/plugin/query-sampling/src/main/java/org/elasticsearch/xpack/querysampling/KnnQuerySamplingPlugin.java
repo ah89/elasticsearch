@@ -26,6 +26,7 @@ import org.elasticsearch.xpack.querysampling.capture.QueryCaptureSink;
 import org.elasticsearch.xpack.querysampling.dedup.MultiplicityTracker;
 import org.elasticsearch.xpack.querysampling.sampling.PickBudget;
 import org.elasticsearch.xpack.querysampling.sampling.QuerySampler;
+import org.elasticsearch.xpack.querysampling.sampling.SpatialStrata;
 
 import java.util.Collection;
 import java.util.List;
@@ -89,7 +90,13 @@ public class KnnQuerySamplingPlugin extends Plugin {
         }
         ClusterSettings clusterSettings = services.clusterService().getClusterSettings();
         MultiplicityTracker tracker = new MultiplicityTracker(MAX_DISTINCT_QUERIES, MULTIPLICITY_WINDOW, System::nanoTime);
-        QuerySampler sampler = new QuerySampler(ACCEPTANCE_SCALE, HEAD_THRESHOLD, Randomness::get, new PickBudget(System::nanoTime));
+        QuerySampler sampler = new QuerySampler(
+            ACCEPTANCE_SCALE,
+            HEAD_THRESHOLD,
+            Randomness::get,
+            new PickBudget(System::nanoTime),
+            new SpatialStrata(QuerySamplingSettings.SPATIAL_CLUSTERS.get(services.clusterService().getSettings()))
+        );
         sampler.watch(clusterSettings);
         // what is picked goes to the listeners of the pipeline; none are registered yet, storing the samples comes later
         SamplingPipeline pipeline = new SamplingPipeline(tracker, sampler, List.of());
