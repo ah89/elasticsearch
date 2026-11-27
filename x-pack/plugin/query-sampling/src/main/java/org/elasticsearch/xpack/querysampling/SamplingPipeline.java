@@ -48,6 +48,10 @@ public final class SamplingPipeline implements Consumer<CapturedSearch> {
         return sampler.starved();
     }
 
+    public double acceptanceScale() {
+        return sampler.effectiveScale();
+    }
+
     @Override
     public synchronized void accept(CapturedSearch captured) {
         QueryFingerprint fingerprint = QueryFingerprint.of(captured.query());

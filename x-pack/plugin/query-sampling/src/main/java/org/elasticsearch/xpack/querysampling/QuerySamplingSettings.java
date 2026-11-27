@@ -60,9 +60,21 @@ public final class QuerySamplingSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Picks per hour (apart from the hottest queries) that the acceptance scale is steered towards; unlike the
+     * max it is only a target. 0 leaves the scale as set.
+     */
+    public static final Setting<Long> TARGET_PICKS_PER_HOUR = Setting.longSetting(
+        "xpack.query_sampling.target_picks_per_hour",
+        0L,
+        0L,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     private QuerySamplingSettings() {}
 
     public static List<Setting<?>> getSettings() {
-        return List.of(ENABLED, CAPTURE_RATE, MIN_CAPTURES_PER_HOUR, MAX_PICKS_PER_HOUR);
+        return List.of(ENABLED, CAPTURE_RATE, MIN_CAPTURES_PER_HOUR, MAX_PICKS_PER_HOUR, TARGET_PICKS_PER_HOUR);
     }
 }

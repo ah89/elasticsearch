@@ -12,7 +12,9 @@ import org.elasticsearch.xpack.querysampling.QuerySamplingSettings;
 import org.elasticsearch.xpack.querysampling.dedup.TrackedQuery;
 
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -23,9 +25,12 @@ import java.util.function.Supplier;
  * depend on it, and the first captured arrival is accepted with {@code γ·ln(1 + weight)}, capped at 1. Head queries,
  * captured at least the head threshold times, are always accepted so estimates do not swing on one coin flip; captures
  * are counted rather than estimated searches, since one capture stands for many searches and would make any captured
- * query look popular.
+ * query look popular. γ is adjusted by
+ * {@link ScaleRegulator}.
  */
 public final class QuerySampler {
+
+    private static final long REGULATION_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
 
     // what is left of the chance of a pick while the pick limit is reached: never 0, so that every query keeps a chance
     static final double LIMITED_FACTOR = 0.01;
@@ -35,12 +40,21 @@ public final class QuerySampler {
     private final Supplier<Random> random;
     private final PickBudget budget;
     private final LongAdder starved = new LongAdder();
+    private final ScaleRegulator regulator = new ScaleRegulator();
+    private final LongSupplier nanoTime;
+    private long lastRegulation; // the pipeline thread only
 
     /**
      * @param scale         γ, the probability scale
      * @param headThreshold captured arrivals from which a query is always picked
      */
     public QuerySampler(double scale, long headThreshold, Supplier<Random> random, PickBudget budget) {
+        this(scale, headThreshold, random, budget, System::nanoTime);
+    }
+
+    QuerySampler(double scale, long headThreshold, Supplier<Random> random, PickBudget budget, LongSupplier nanoTime) {
+        this.nanoTime = nanoTime;
+        this.lastRegulation = nanoTime.getAsLong();
         this.scale = scale;
         this.headThreshold = headThreshold;
         this.random = random;
@@ -49,6 +63,18 @@ public final class QuerySampler {
 
     public void watch(ClusterSettings clusterSettings) {
         clusterSettings.initializeAndWatch(QuerySamplingSettings.MAX_PICKS_PER_HOUR, budget::perHour);
+        clusterSettings.initializeAndWatch(QuerySamplingSettings.TARGET_PICKS_PER_HOUR, regulator::targetPerHour);
+    }
+
+    // Brings γ up to date with the pick rate once ten seconds have passed. The arrivals do it, as they are what makes the picks, so
+    // nothing is scheduled; it changes nothing while no target is set. After a quiet spell one step covers all of it.
+    private void regulate() {
+        long now = nanoTime.getAsLong();
+        long elapsed = now - lastRegulation;
+        if (elapsed >= REGULATION_INTERVAL_NANOS) {
+            regulator.observe(elapsed / 1_000_000_000.0);
+            lastRegulation = now;
+        }
     }
 
     /** Arrivals whose chance to be picked was cut because the pick limit was reached. */
@@ -56,15 +82,20 @@ public final class QuerySampler {
         return starved.sum();
     }
 
+    public double effectiveScale() {
+        return scale * regulator.adjustment();
+    }
+
     /** The chance of a pick before it is capped at 1. */
     private double uncappedAcceptance(double multiplicity, double weight) {
-        return scale * Math.log1p(weight / (1.0 + multiplicity - weight));
+        return effectiveScale() * Math.log1p(weight / (1.0 + multiplicity - weight));
     }
 
     /**
      * @return whether this arrival picked the query, which happens at most once per query
      */
     public boolean offer(TrackedQuery query) {
+        regulate();
         TrackedQuery.Weights weights = query.weights();
         double multiplicity = weights.weightedMultiplicity();
         // The hottest queries are always picked, without using the limit. The damping gives a query that is seen a lot a small chance
@@ -92,6 +123,7 @@ public final class QuerySampler {
         query.markSampled();
         if (head == false) {
             budget.take();
+            regulator.recordPick();
         }
         return true;
     }
