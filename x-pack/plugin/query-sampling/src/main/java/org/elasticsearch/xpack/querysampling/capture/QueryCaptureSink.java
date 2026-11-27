@@ -263,7 +263,7 @@ public final class QueryCaptureSink extends QuerySink<QueryCaptureContext> {
         return false;
     }
 
-    // sorted by a field, the hits have no score, which the samples are made of; sorted by score
+    // sorted by a field, the hits have no score, which the samples and the hardness of a query are made of; sorted by score
     // in ascending order, they are the worst of the candidates, not the nearest ones
     private static boolean returnsOtherHitsThanTheBestScoredFirst(SearchSourceBuilder source) {
         return source.sorts() != null

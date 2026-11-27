@@ -9,8 +9,10 @@ package org.elasticsearch.xpack.querysampling.sampling;
 
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.xpack.querysampling.QuerySamplingSettings;
+import org.elasticsearch.xpack.querysampling.capture.CapturedSearch;
 import org.elasticsearch.xpack.querysampling.dedup.TrackedQuery;
 
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
@@ -25,7 +27,7 @@ import java.util.function.Supplier;
  * depend on it, and the first captured arrival is accepted with {@code γ·ln(1 + weight)}, capped at 1. Head queries,
  * captured at least the head threshold times, are always accepted so estimates do not swing on one coin flip; captures
  * are counted rather than estimated searches, since one capture stands for many searches and would make any captured
- * query look popular. Picks are tilted by {@link SpatialStrata}, and γ is adjusted by
+ * query look popular. Picks are tilted by {@link SpatialStrata} and {@link HardnessStrata}, and γ is adjusted by
  * {@link ScaleRegulator}.
  */
 public final class QuerySampler {
@@ -40,6 +42,7 @@ public final class QuerySampler {
     private final Supplier<Random> random;
     private final PickBudget budget;
     private final SpatialStrata spatial;
+    private final HardnessStrata hardness;
     private final LongAdder starved = new LongAdder();
     private final ScaleRegulator regulator = new ScaleRegulator();
     private final LongSupplier nanoTime;
@@ -64,6 +67,7 @@ public final class QuerySampler {
         this.nanoTime = nanoTime;
         this.lastRegulation = nanoTime.getAsLong();
         this.spatial = spatial;
+        this.hardness = new HardnessStrata();
         this.scale = scale;
         this.headThreshold = headThreshold;
         this.random = random;
@@ -74,6 +78,7 @@ public final class QuerySampler {
         clusterSettings.initializeAndWatch(QuerySamplingSettings.MAX_PICKS_PER_HOUR, budget::perHour);
         clusterSettings.initializeAndWatch(QuerySamplingSettings.TARGET_PICKS_PER_HOUR, regulator::targetPerHour);
         spatial.watch(clusterSettings);
+        hardness.watch(clusterSettings);
     }
 
     // Brings γ up to date with the pick rate once ten seconds have passed. The arrivals do it, as they are what makes the picks, so
@@ -108,6 +113,10 @@ public final class QuerySampler {
         spatial.assign(field, vector, stratum -> query.stratum(stratum));
     }
 
+    public void assignHardness(TrackedQuery query, String field, int dims, List<CapturedSearch.Hit> hits) {
+        query.hardness(hardness.assign(field, dims, hits));
+    }
+
     /**
      * @return whether this arrival picked the query, which happens at most once per query
      */
@@ -122,7 +131,7 @@ public final class QuerySampler {
         boolean head = weights.multiplicity() >= headThreshold;
         double probability = 1.0;
         if (head == false) {
-            double strata = spatial.factor(query.stratum());
+            double strata = spatial.factor(query.stratum()) * hardness.factor(query.hardness());
             probability = Math.min(1.0, uncappedAcceptance(multiplicity, 1.0 / weights.captureRate()) * strata);
         }
         if (head == false && budget.available() == false) {

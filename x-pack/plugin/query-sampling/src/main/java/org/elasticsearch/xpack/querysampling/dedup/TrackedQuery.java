@@ -24,6 +24,7 @@ public final class TrackedQuery {
     private double logSurvival;
     private boolean sampled;
     private Stratum stratum;
+    private Hardness hardness;
     private boolean placed;
 
     // weight is the inverse of the capture probability: how many arrivals this captured one stands for
@@ -62,7 +63,16 @@ public final class TrackedQuery {
         this.stratum = stratum;
     }
 
-    /** Whether the query has been put in its spatial stratum, which is done once, on the first capture that has hits. */
+    @Nullable
+    public synchronized Hardness hardness() {
+        return hardness;
+    }
+
+    public synchronized void hardness(@Nullable Hardness hardness) {
+        this.hardness = hardness;
+    }
+
+    /** Whether the query has been put in its strata, which is done once, on the first capture that has hits. */
     public synchronized boolean isPlaced() {
         return placed;
     }

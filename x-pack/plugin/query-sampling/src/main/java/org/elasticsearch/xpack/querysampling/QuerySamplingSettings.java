@@ -98,6 +98,19 @@ public final class QuerySamplingSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Tilts picking towards hard queries (hits all about as good as the first) by {@code e^η} for the hardest
+     * third and {@code e^-η} for the easiest. 0 does not tilt. The default, 1, is what the offline replay used.
+     */
+    public static final Setting<Double> HARDNESS_TILT = Setting.doubleSetting(
+        "xpack.query_sampling.hardness_tilt",
+        1.0,
+        0.0,
+        10.0,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     private QuerySamplingSettings() {}
 
     public static List<Setting<?>> getSettings() {
@@ -108,7 +121,8 @@ public final class QuerySamplingSettings {
             MAX_PICKS_PER_HOUR,
             TARGET_PICKS_PER_HOUR,
             SPATIAL_CLUSTERS,
-            SPATIAL_BALANCE
+            SPATIAL_BALANCE,
+            HARDNESS_TILT
         );
     }
 }

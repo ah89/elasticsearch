@@ -84,6 +84,7 @@ public class SamplingPipelineTests extends ESTestCase {
 
         TrackedQuery query = tracker.record(QueryFingerprint.of(search(vector).query()), 1.0);
         assertNotNull("it found something later, and the index may have been empty before", query.stratum());
+        assertNotNull(query.hardness());
         assertTrue(query.isPlaced());
     }
 
@@ -107,7 +108,7 @@ public class SamplingPipelineTests extends ESTestCase {
         List<CapturedSearch.Hit> hits = List.of(
             new CapturedSearch.Hit("idx", "doc1", 1f),
             new CapturedSearch.Hit("idx", "doc2", 0.5f),
-            new CapturedSearch.Hit("idx", "doc3", 0.25f)
+            new CapturedSearch.Hit("idx", "doc3", 0.25f) // hardness needs three
         );
         return new CapturedSearch(query, hits, 1, 1.0);
     }
