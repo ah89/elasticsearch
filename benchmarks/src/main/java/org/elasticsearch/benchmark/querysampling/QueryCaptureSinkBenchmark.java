@@ -51,6 +51,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * What the capture sink of the query sampling framework adds to a search, which is the one part of the framework that runs
@@ -83,6 +84,10 @@ import java.util.concurrent.TimeUnit;
  * captured one copies its query (its filter as JSON) and the hits of its response and hands them on, which costs about 240 ns
  * alone and about 335 ns with eight threads at once.
  * What a capture hands on is retained by a blackhole, as the plugin retains it, so that the JIT cannot drop the copying.
+ * <p>
+ * The sink reads a clock on every kNN search, to bring its capture rate up to date once in a while. With
+ * {@code System.nanoTime()} that read alone made a search that is not captured cost about 395 ns with eight threads on an
+ * Apple M4 Pro, so the sink is given a cached clock, like the cached time of the thread pool, which the benchmark mimics.
  */
 @Fork(1)
 @Warmup(iterations = 3, time = 1)
@@ -104,6 +109,10 @@ public class QueryCaptureSinkBenchmark {
     @Param({ "disabled", "not_a_knn_search", "knn_not_captured", "knn_captured" })
     public String scenario;
 
+    // like the cached time of the thread pool, which is what the sink is given: one thread updates it, the searches read it
+    private volatile long cachedMillis;
+    private Thread clockThread;
+
     private QueryCaptureSink sink;
     private SearchResponse response;
     private SearchCaptureContext context;
@@ -111,16 +120,29 @@ public class QueryCaptureSinkBenchmark {
     @Setup
     public void setUp() {
         BenchmarkLogging.configure(); // the sink logs, so it needs a logger factory
+        cachedMillis = System.nanoTime() / 1_000_000;
+        clockThread = new Thread(() -> {
+            while (Thread.currentThread().isInterrupted() == false) {
+                cachedMillis = System.nanoTime() / 1_000_000;
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(200));
+            }
+        }, "cached-clock");
+        clockThread.setDaemon(true);
+        clockThread.start();
         boolean enabled = scenario.equals("disabled") == false;
         double captureRate = scenario.equals("knn_captured") ? 1.0 : 0.0;
         Settings settings = Settings.builder()
             .put(QuerySamplingSettings.ENABLED.getKey(), enabled)
             .put(QuerySamplingSettings.CAPTURE_RATE.getKey(), captureRate)
+            .put(QuerySamplingSettings.MIN_CAPTURES_PER_HOUR.getKey(), 0) // a floor would add rare captures to "not captured"
             .build();
         sink = new QueryCaptureSink(
-            new ClusterSettings(settings, Set.of(QuerySamplingSettings.ENABLED, QuerySamplingSettings.CAPTURE_RATE)),
+            new ClusterSettings(
+                settings,
+                Set.of(QuerySamplingSettings.ENABLED, QuerySamplingSettings.CAPTURE_RATE, QuerySamplingSettings.MIN_CAPTURES_PER_HOUR)
+            ),
             captured -> CAPTURED.get().consume(captured),
-            () -> 0L, // only read to log a failure at most once a minute
+            () -> cachedMillis,
             ThreadLocalRandom::current // Randomness.get() fails in this JVM, which has the test framework but no test
         );
 
@@ -176,6 +198,7 @@ public class QueryCaptureSinkBenchmark {
 
     @TearDown
     public void tearDown() {
+        clockThread.interrupt();
         response.decRef();
     }
 
